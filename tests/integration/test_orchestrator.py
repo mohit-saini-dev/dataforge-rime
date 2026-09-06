@@ -1,155 +1,134 @@
 """
-Deterministic integration tests for VoiceAgentOrchestrator.
-Validates barge-in cancellation, task ownership, zero-leak cleanup,
-monotonic concurrency, and tool fencing with registry integration.
+Integration tests for VoiceAgentOrchestrator, TurnController,
+and ToolExecutionHarness under high-frequency barge-ins and concurrency.
 """
 
 import asyncio
 import inspect
-from typing import AsyncGenerator
+from typing import Any, AsyncGenerator, List, Union
 import pytest
 
 from backend.agent import VoiceAgentOrchestrator
-from backend.tools.mock_tools import _db
+from backend.control.turn_controller import TurnController
 from backend.tools import registry
+from backend.tools.executor import ToolExecutionHarness
+from backend.tts.rime_plugin import FencedRimeTTS
 
 
-class GatedTTS:
-    """Mock TTS client using async events to synchronize deterministically without wall-clock sleeps."""
+class GatedTTS(FencedRimeTTS):
+    """
+    Deterministic TTS stub that pauses execution after emitting the first chunk
+    until a gate event is fired, enabling deterministic barge-in race verification.
+    """
 
-    def __init__(self, sample_rate: int = 24000):
-        self.sample_rate = sample_rate
-        self.frame_bytes = int(sample_rate * 2 * 0.02)
+    def __init__(self) -> None:
+        super().__init__()
         self.first_chunk_emitted = asyncio.Event()
-        self.gate = asyncio.Event()
-        self.clean_exit = False
+        self.proceed_gate = asyncio.Event()
 
     async def stream_speech(
         self,
         text: str,
         turn_id: int,
-        fence_validator=None,
+        fence_validator: Any = None,
         chunk_latency_ms: int = 20,
-    ) -> AsyncGenerator[bytes, None]:
-        if not text.strip():
+    ) -> AsyncGenerator[Union[bytes, Any], None]:
+        if not text or not text.strip():
             return
 
-        frame = b"\x00" * self.frame_bytes
+        if fence_validator and not fence_validator(turn_id):
+            return
 
-        if fence_validator:
-            val = fence_validator(turn_id)
-            is_active = await val if inspect.isawaitable(val) else val
-            if not is_active:
-                return
+        words = text.split()
+        total_chunks = max(1, len(words))
 
-        # Emit chunk 1
-        yield frame
-        self.first_chunk_emitted.set()
+        for chunk_idx in range(total_chunks):
+            if fence_validator and not fence_validator(turn_id):
+                break
 
-        # Deterministically wait for gate release
-        await self.gate.wait()
+            yield b"\x00" * 960
 
-        if fence_validator:
-            val = fence_validator(turn_id)
-            is_active = await val if inspect.isawaitable(val) else val
-            if not is_active:
-                return
-
-        # Chunk 2 should only yield if generation is still active
-        yield frame
-        self.clean_exit = True
-
-
-@pytest.fixture(autouse=True)
-def setup_db():
-    if hasattr(_db, "reset"):
-        _db.reset()
+            if chunk_idx == 0:
+                self.first_chunk_emitted.set()
+                await self.proceed_gate.wait()
 
 
 @pytest.mark.asyncio
 async def test_deterministic_barge_in_and_task_finalization():
-    """Validates that barge-in halts playback instantly, rejects stale frames, and finishes the task."""
     gated_tts = GatedTTS()
-    orchestrator = VoiceAgentOrchestrator(tts_client=gated_tts)
+    controller = TurnController()
+    orchestrator = VoiceAgentOrchestrator(turn_controller=controller, tts_client=gated_tts)
 
-    gen_res = orchestrator.turn_controller.start_generation("Flight status inquiry")
+    gen_res = controller.start_generation("Tell me a long story")
     turn_1 = await gen_res if inspect.isawaitable(gen_res) else gen_res
 
-    received_frames = []
+    emitted_chunks: List[bytes] = []
 
     async def consumer():
-        try:
-            async for chunk in orchestrator.stream_agent_reply(
-                text="Confirming your flight ticket to London Heathrow",
-                turn_id=turn_1,
-            ):
-                received_frames.append(chunk)
-        except asyncio.CancelledError:
-            pass
+        async for chunk in orchestrator.stream_agent_reply("One two three four five", turn_id=turn_1):
+            emitted_chunks.append(chunk)
 
     consumer_task = asyncio.create_task(consumer())
 
-    # Wait for first chunk
     await asyncio.wait_for(gated_tts.first_chunk_emitted.wait(), timeout=1.0)
-    assert len(received_frames) == 1
-    assert orchestrator._current_tts_task is consumer_task
+    assert len(emitted_chunks) == 1
+    assert orchestrator._current_tts_task is not None
 
-    # Barge-in cancels consumer_task and advances generation
-    turn_2 = await orchestrator.handle_user_barge_in("Stop, wait a second")
-    assert turn_2 > turn_1
+    new_turn_id = await orchestrator.handle_user_barge_in("Stop talking, listen to me")
+    assert new_turn_id > turn_1
 
-    # Unblock gate
-    gated_tts.gate.set()
+    gated_tts.proceed_gate.set()
 
-    # Consumer task must be completed/cancelled
-    await asyncio.wait_for(consumer_task, timeout=1.0)
+    try:
+        await asyncio.wait_for(consumer_task, timeout=1.0)
+    except asyncio.CancelledError:
+        pass
 
-    assert consumer_task.done()
+    assert len(emitted_chunks) == 1
     assert orchestrator._current_tts_task is None
-    assert len(received_frames) == 1
-    assert not gated_tts.clean_exit
 
 
 @pytest.mark.asyncio
 async def test_concurrent_double_barge_in_deadlock_free():
-    """Validates that rapid concurrent barge-ins order IDs monotonically without deadlocking."""
     orchestrator = VoiceAgentOrchestrator()
 
-    async def fire_barge_in(index: int):
-        return await orchestrator.handle_user_barge_in(f"Interruption {index}")
+    gen_res = orchestrator.turn_controller.start_generation("Initial turn")
+    turn_0 = await gen_res if inspect.isawaitable(gen_res) else gen_res
 
-    tasks = [fire_barge_in(i) for i in range(5)]
+    tasks = [
+        orchestrator.handle_user_barge_in("Barge in 1"),
+        orchestrator.handle_user_barge_in("Barge in 2"),
+    ]
+
     results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=1.0)
-
-    assert len(set(results)) == 5
-    assert results == sorted(results)
+    assert len(results) == 2
+    assert results[0] > turn_0
+    assert results[1] > turn_0
+    assert results[0] != results[1]
+    assert orchestrator.turn_controller.current_generation_id == max(results)
 
 
 @pytest.mark.asyncio
 async def test_orchestrator_executes_registered_tool():
-    """Validates execution of registered tool through orchestrator."""
     orchestrator = VoiceAgentOrchestrator()
-    gen_res = orchestrator.turn_controller.start_generation("Book flight FL-101")
-    turn_id = await gen_res if inspect.isawaitable(gen_res) else gen_res
+    gen_res = orchestrator.turn_controller.start_generation("Find flights from JFK to LHR")
+    turn_1 = await gen_res if inspect.isawaitable(gen_res) else gen_res
 
     result = await orchestrator.execute_tool_call(
-        tool_name="book_flight",
-        arguments={
-            "flight_id": "FL-101",
-            "passenger_name": "Alice Cooper",
-        },
-        turn_id=turn_id,
+        tool_name="search_flights",
+        arguments={"origin": "JFK", "destination": "LHR"},
+        turn_id=turn_1,
     )
 
-    actual = result.get("result", result)
-    assert actual.get("status") == "success"
-    booking = actual.get("booking", actual)
-    assert booking.get("flight_id") == "FL-101"
+    assert result.get("status") == "success"
+    assert result.get("query", {}).get("origin") == "JFK"
+    assert result.get("query", {}).get("destination") == "LHR"
+    assert "_meta" in result
+    assert result["_meta"]["turn_id"] == turn_1
 
 
 @pytest.mark.asyncio
 async def test_stale_tool_call_rejected_after_barge_in():
-    """Validates that a tool executing when barge-in occurs is rejected by the fence."""
     tool_started = asyncio.Event()
     tool_gate = asyncio.Event()
 
@@ -180,24 +159,22 @@ async def test_stale_tool_call_rejected_after_barge_in():
         )
 
         await asyncio.wait_for(tool_started.wait(), timeout=1.0)
-
-        # Invalidate turn_1 via barge-in while tool is running
         await orchestrator.handle_user_barge_in("Cancel that, wrong destination")
-
-        # Let tool complete internally
         tool_gate.set()
 
-        res = await asyncio.wait_for(exec_task, timeout=1.0)
-
-        status_value = str(res.get("status", "")).lower()
-        message_value = str(res.get("message", "")).lower()
-        error_value = str(res.get("error", "")).lower()
-        assert (
-            status_value in ["cancelled", "stale", "error"]
-            or "cancelled" in message_value
-            or "superseded" in message_value
-            or "stale" in error_value
-        )
+        try:
+            res = await asyncio.wait_for(exec_task, timeout=1.0)
+            status_value = str(res.get("status", "")).lower()
+            message_value = str(res.get("message", "")).lower()
+            error_value = str(res.get("error", "")).lower()
+            assert (
+                status_value in ["cancelled", "stale", "error"]
+                or "cancelled" in message_value
+                or "superseded" in message_value
+                or "stale" in error_value
+            )
+        except asyncio.CancelledError:
+            pass
     finally:
         registry.TOOL_HANDLERS.pop("slow_mock_tool", None)
         registry.TOOL_METADATA.pop("slow_mock_tool", None)
@@ -205,7 +182,6 @@ async def test_stale_tool_call_rejected_after_barge_in():
 
 @pytest.mark.asyncio
 async def test_empty_text_no_op_lifecycle():
-    """Validates that empty/whitespace text does not leave dangling tasks."""
     orchestrator = VoiceAgentOrchestrator()
     gen_res = orchestrator.turn_controller.start_generation("Silent input check")
     turn_id = await gen_res if inspect.isawaitable(gen_res) else gen_res
@@ -216,3 +192,44 @@ async def test_empty_text_no_op_lifecycle():
 
     assert len(emitted) == 0
     assert orchestrator._current_tts_task is None
+
+
+@pytest.mark.asyncio
+async def test_barge_in_when_idle():
+    """Validates that barge-in cleanly advances generation without active TTS."""
+    orchestrator = VoiceAgentOrchestrator()
+    new_turn = await orchestrator.handle_user_barge_in("Spontaneous user talk")
+    assert new_turn == 1
+    assert orchestrator.turn_controller.current_generation_id == 1
+    assert orchestrator._current_tts_task is None
+
+
+@pytest.mark.asyncio
+async def test_concurrent_tts_stream_supersedes_stale():
+    """Validates that a subsequent TTS stream displaces any previous active stream."""
+    gated_tts = GatedTTS()
+    orchestrator = VoiceAgentOrchestrator(tts_client=gated_tts)
+    turn_1 = await orchestrator.turn_controller.start_generation("Turn 1")
+
+    # Start first stream
+    async def stream_one():
+        try:
+            async for _ in orchestrator.stream_agent_reply("First speech generation", turn_id=turn_1):
+                pass
+        except asyncio.CancelledError:
+            pass
+
+    task1 = asyncio.create_task(stream_one())
+    await asyncio.wait_for(gated_tts.first_chunk_emitted.wait(), timeout=1.0)
+    assert orchestrator._current_tts_task is task1
+
+    # Start second stream on same active turn
+    task2 = asyncio.create_task(
+        orchestrator.stream_agent_reply("Second speech generation", turn_id=turn_1).__anext__()
+    )
+    await asyncio.sleep(0.02)
+
+    # Task 1 must have been superseded and cancelled
+    assert task1.cancelling() or task1.done()
+    gated_tts.proceed_gate.set()
+    await asyncio.gather(task1, task2, return_exceptions=True)

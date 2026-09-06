@@ -1,18 +1,20 @@
 """
-Monotonic Generation Fence — V2.3 Reference Implementation.
+Monotonic Generation Fence – V2.3 Reference Implementation.
 State Machine: CREATED -> ACTIVE -> INVALIDATED -> DRAINING -> TERMINATED
-Correctness Guarantee: "Cancellation is best-effort; the Generation Fence is the correctness guarantee."
+Correctness Guarantee: "Cancellation is best-effort; the Generation Fence is the correctness barrier."
 """
+
 from __future__ import annotations
 import asyncio
 import uuid
 import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Any, Dict, List, Optional, Callable, Awaitable
+from typing import Any, Dict, List, Optional, Awaitable
 import logging
 
 logger = logging.getLogger(__name__)
+
 
 class GenState(Enum):
     CREATED = auto()
@@ -20,6 +22,7 @@ class GenState(Enum):
     INVALIDATED = auto()
     DRAINING = auto()
     TERMINATED = auto()
+
 
 @dataclass(slots=True)
 class Operation:
@@ -32,8 +35,9 @@ class Operation:
     result: Any = None
     error: BaseException | None = None
 
+
 class TurnController:
-    def __init__(self) -> None:
+    def __init__(self, max_retained_generations: int = 50) -> None:
         self._lock = asyncio.Lock()
         self._gen_counter: int = 0
         self._current_gen_id: int = 0
@@ -42,6 +46,7 @@ class TurnController:
         self._gen_ops: Dict[int, List[str]] = {}
         self.conversation_history: List[Dict[str, Any]] = []
         self._history_snapshots: Dict[int, List[Dict[str, Any]]] = {}
+        self._max_retained_generations = max_retained_generations
 
     @property
     def current_generation_id(self) -> int:
@@ -64,7 +69,26 @@ class TurnController:
             and not op.cancelled
         )
 
+    def _prune_old_generations_locked(self) -> None:
+        """Prunes historical state to prevent unbounded memory growth in long-running sessions."""
+        if self._gen_counter <= self._max_retained_generations:
+            return
+
+        cutoff = self._gen_counter - self._max_retained_generations
+        stale_gens = [gid for gid in list(self._gen_state.keys()) if gid < cutoff]
+
+        for gid in stale_gens:
+            self._gen_state.pop(gid, None)
+            self._history_snapshots.pop(gid, None)
+            op_ids = self._gen_ops.pop(gid, [])
+            for op_id in op_ids:
+                self._operations.pop(op_id, None)
+
     def _start_generation_locked(self, user_text: str) -> int:
+        # Explicitly transition old active generation to INVALIDATED
+        if self._current_gen_id != 0 and self._gen_state.get(self._current_gen_id) == GenState.ACTIVE:
+            self._gen_state[self._current_gen_id] = GenState.INVALIDATED
+
         self._gen_counter += 1
         new_gen_id = self._gen_counter
         self._history_snapshots[new_gen_id] = [msg.copy() for msg in self.conversation_history]
@@ -72,6 +96,9 @@ class TurnController:
         self._gen_state[new_gen_id] = GenState.ACTIVE
         self._current_gen_id = new_gen_id
         self._gen_ops[new_gen_id] = []
+
+        self._prune_old_generations_locked()
+
         logger.info(f"[FENCE] Generation {new_gen_id} STARTED | History len={len(self.conversation_history)}")
         return new_gen_id
 
@@ -89,15 +116,25 @@ class TurnController:
             return True
 
     def register_operation(self, gen_id: int, kind: str, coro_or_task: Any) -> str:
+        """
+        Registers an async task/coroutine under generation ownership.
+        Rejects stale generations synchronously.
+        """
         op_id = f"gen_{gen_id}_op_{uuid.uuid4().hex[:8]}"
-        if isinstance(coro_or_task, asyncio.Task):
-            task = coro_or_task
-        elif asyncio.iscoroutine(coro_or_task):
+
+        if asyncio.iscoroutine(coro_or_task):
             task = asyncio.create_task(coro_or_task, name=op_id)
-        elif callable(coro_or_task):
-            task = asyncio.create_task(coro_or_task(), name=op_id)
+        elif isinstance(coro_or_task, asyncio.Task):
+            task = coro_or_task
         else:
-            raise TypeError("Expected coroutine, Task, or callable returning coroutine")
+            raise TypeError("Expected coroutine or asyncio.Task")
+
+        # If the generation is already dead or not active, cancel immediately
+        if not self.validate_generation(gen_id):
+            task.cancel()
+            op = Operation(op_id=op_id, gen_id=gen_id, kind=kind, task=task, cancelled=True)
+            self._operations[op_id] = op
+            return op_id
 
         op = Operation(op_id=op_id, gen_id=gen_id, kind=kind, task=task)
         self._operations[op_id] = op
@@ -147,7 +184,7 @@ class TurnController:
 
             self.conversation_history.append({
                 "role": "system",
-                "content": f"[User interrupted Generation {invalidated_gen_id}. Previous tool calls discarded.]",
+                "content": f"[User interrupted Generation {invalidated_gen_id}. Previous tool execution cancelled.]"
             })
 
             new_gen_id = self._start_generation_locked(new_user_text)
@@ -155,6 +192,7 @@ class TurnController:
             return new_gen_id
 
     async def cancel_generation_ops(self, gen_id: int) -> List[str]:
+        """Cancels all active tasks for gen_id and sets state to DRAINING."""
         cancelled_ids = []
         op_ids = self._gen_ops.get(gen_id, [])
         for op_id in op_ids:
@@ -163,11 +201,13 @@ class TurnController:
                 op.task.cancel()
                 op.cancelled = True
                 cancelled_ids.append(op_id)
-        if cancelled_ids:
+        if cancelled_ids or self._gen_state.get(gen_id) == GenState.ACTIVE:
             self._gen_state[gen_id] = GenState.DRAINING
         return cancelled_ids
 
+
 _turn_controller: TurnController | None = None
+
 
 def get_turn_controller() -> TurnController:
     global _turn_controller

@@ -1,6 +1,6 @@
 """
 Async tool execution harness with generation fencing, latency timeouts,
-execution latency profiling, and cancellation boundaries.
+execution latency profiling, cancellation boundaries, and TurnController registration.
 """
 
 import asyncio
@@ -73,10 +73,11 @@ class ToolExecutionHarness:
         arguments: Dict[str, Any],
         turn_id: int,
         fence_validator: Optional[FenceValidator] = None,
+        turn_controller: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """
         Safely execute a tool with generation fencing, timeout enforcement,
-        and latency tracking.
+        TurnController registration, and latency tracking.
         """
         start_time = time.perf_counter()
 
@@ -102,7 +103,19 @@ class ToolExecutionHarness:
         # 4. Latency budget configuration
         timeout_sec = meta.get("max_latency_ms", 1500) / 1000.0
 
-        # 5. Execution within timeout and cancellation boundary
+        # 5. Execution within timeout, registration, and cancellation boundary
+        current_task = asyncio.current_task()
+        op_id = None
+        if turn_controller and current_task:
+            try:
+                op_id = turn_controller.register_operation(
+                    gen_id=turn_id,
+                    kind=f"tool_{tool_name}",
+                    coro_or_task=current_task,
+                )
+            except Exception as e:
+                logger.warning("Failed to register tool '%s' with TurnController: %s", tool_name, e)
+
         try:
             async with asyncio.timeout(timeout_sec):
                 result = await handler(**arguments)
@@ -115,7 +128,6 @@ class ToolExecutionHarness:
                 tool_name,
             )
         except asyncio.CancelledError:
-            # Re-raise so TaskGroup/TurnController can coordinate cancellations and rollbacks
             logger.info("Tool '%s' received task cancellation during execution for turn %s", tool_name, turn_id)
             raise
         except Exception as exc:
@@ -130,11 +142,13 @@ class ToolExecutionHarness:
 
         # 7. Attach execution metadata for turn binding
         elapsed_ms = round((time.perf_counter() - start_time) * 1000, 2)
-        if isinstance(result, dict):
-            result["_meta"] = {
-                "turn_id": turn_id,
-                "tool_name": tool_name,
-                "execution_time_ms": elapsed_ms,
-            }
+        if not isinstance(result, dict):
+            result = {"result": result}
+
+        result["_meta"] = {
+            "turn_id": turn_id,
+            "tool_name": tool_name,
+            "execution_time_ms": elapsed_ms,
+        }
 
         return result
