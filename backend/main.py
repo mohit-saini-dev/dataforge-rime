@@ -158,19 +158,19 @@ class AudioPump:
 class SessionManager:
     """Supervises participant session with strict admission control and task ownership."""
 
-    def __init__(self, ctx: JobContext, room: rtc.Room, participant: rtc.RemoteParticipant):
+    def __init__(self, ctx: JobContext, room: rtc.Room, participant: rtc.RemoteParticipant | None):
         self.ctx = ctx
         self.room = room
         self.participant = participant
         self.turn_controller = TurnController()
         self.tool_harness = ToolExecutionHarness(self.turn_controller)
-        self.tts = FencedRimeTTS(api_key=RIME_API_KEY, turn_controller=self.turn_controller)
+        self.tts = FencedRimeTTS(api_key=RIME_API_KEY)
         self.audio_source = rtc.AudioSource(SAMPLE_RATE, NUM_CHANNELS)
         self.audio_pump = AudioPump(self.audio_source, SAMPLE_RATE)
 
         self._session_tasks: Set[asyncio.Task] = set()
         self._current_turn_task: asyncio.Task | None = None
-        self._last_barge_in_time = 0.0
+        self.last_barge_in_time = 0.0
         self._is_closing = False
         self._shutdown_event = asyncio.Event()
 
@@ -197,10 +197,10 @@ class SessionManager:
     async def handle_barge_in(self, reason: str = "user_speech") -> int | None:
         """Debounced barge-in handling with immediate upstream LLM stream cancellation."""
         now = time.monotonic()
-        if now - self._last_barge_in_time < BARGE_IN_DEBOUNCE_SEC:
+        if now - self.last_barge_in_time < BARGE_IN_DEBOUNCE_SEC:
             logger.debug("[Session] Debounced redundant barge-in trigger")
             return None
-        self._last_barge_in_time = now
+        self.last_barge_in_time = now
 
         # 1. Instantly cancel active LLM / TTS turn task to free HTTP sockets
         if self._current_turn_task and not self._current_turn_task.done():
@@ -217,7 +217,7 @@ class SessionManager:
         """Runs the turn with explicit reference tracking and hard timeout."""
         try:
             await asyncio.wait_for(
-                self._execute_turn_stream(prompt, gen_id),
+                self.execute_turn_stream(prompt, gen_id),
                 timeout=LLM_STREAM_TIMEOUT_SEC,
             )
         except asyncio.TimeoutError:
@@ -226,7 +226,7 @@ class SessionManager:
             logger.info(f"[Session] Turn {gen_id} cancelled cleanly via interruption")
             raise
 
-    async def _execute_turn_stream(self, prompt: str, gen_id: int):
+    async def execute_turn_stream(self, prompt: str, gen_id: int):
         # Conversational generation stream logic
         pass
 
@@ -259,14 +259,21 @@ class SessionManager:
                 )
                 logger.info(f"[Session] Teardown finished for {len(pending)} tasks")
             except asyncio.TimeoutError:
-                logger.warning(f"[Session] Hard shutdown timeout ({SHUTDOWN_TIMEOUT_SEC}s) reached; forcing exit")
+                logger.warning(f"[Session] Hard shutdown timeout ({SHUTDOWN_TIMEOUT_SEC}s) reached")
+
+    async def wait_until_closed(self) -> None:
+        await self._shutdown_event.wait()
 
 
 async def entrypoint(ctx: JobContext) -> None:
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
     room = ctx.room
 
-    participant = await ctx.wait_for_participant()
+    try:
+        participant = await asyncio.wait_for(ctx.wait_for_participant(), timeout=2.0)
+    except asyncio.TimeoutError:
+        participant = next(iter(ctx.room.remote_participants.values()), None)
+
     session = SessionManager(ctx, room, participant)
 
     try:
@@ -274,14 +281,14 @@ async def entrypoint(ctx: JobContext) -> None:
 
         @room.on("participant_speech_started")
         def on_participant_speech_started(_: rtc.RemoteParticipant):
-            session.supervise_task(session.handle_barge_in("[voice_interruption]"), name="barge_in")
+            session.supervise_task(session.handle_barge_in("[voice_interruption]"), name="barge_in_handler")
 
         @room.on("disconnected")
         def on_disconnected():
             logger.info("[Room] Disconnect received; triggering session shutdown")
             asyncio.create_task(session.shutdown())
 
-        await session._shutdown_event.wait()
+        await session.wait_until_closed()
     finally:
         # Guarantee teardown on SIGTERM, worker eviction, or unhandled exceptions
         await session.shutdown()
