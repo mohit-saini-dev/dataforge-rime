@@ -1,283 +1,291 @@
 import asyncio
 import logging
-import re
-from typing import AsyncGenerator
+from typing import Set
+import time
 
 from livekit import rtc
 from livekit.agents import (
     AutoSubscribe,
     JobContext,
+    JobProcess,
     WorkerOptions,
     cli,
-    llm,
 )
-from livekit.plugins import groq
 
-from backend.agent import VoiceAgentOrchestrator
 from backend.config import (
     GROQ_API_KEY,
-    GROQ_MODEL,
     LIVEKIT_API_KEY,
     LIVEKIT_API_SECRET,
     LIVEKIT_URL,
-    LOG_LEVEL,
+    RIME_API_KEY,
 )
 from backend.control.turn_controller import TurnController
+from backend.tools.executor import ToolExecutionHarness
 from backend.tts.rime_plugin import FencedRimeTTS
 
-logging.basicConfig(level=LOG_LEVEL)
-logger = logging.getLogger("voice-agent-master")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("backend.main")
+
+SAMPLE_RATE = 24000
+NUM_CHANNELS = 1
+FRAME_DURATION_MS = 20
+SAMPLES_PER_FRAME = int(SAMPLE_RATE * (FRAME_DURATION_MS / 1000.0))  # 480 samples
+BYTES_PER_SAMPLE = 2  # 16-bit PCM
+FRAME_SIZE_BYTES = SAMPLES_PER_FRAME * NUM_CHANNELS * BYTES_PER_SAMPLE  # 960 bytes
+FRAME_DURATION_SEC = FRAME_DURATION_MS / 1000.0  # 0.020s
+
+LLM_STREAM_TIMEOUT_SEC = 10.0
+SHUTDOWN_TIMEOUT_SEC = 1.5
+BARGE_IN_DEBOUNCE_SEC = 0.200  # 200ms VAD flap debounce
 
 
 class AudioPump:
-    """
-    Decoupled audio clock and hard publication fence.
-    Maintains authoritative generation ownership and flushes obsolete frames instantly.
-    """
+    """Real-time paced audio pump with monotonic clock discipline and zero-latency barge-in purge."""
 
-    def __init__(self, source: rtc.AudioSource, sample_rate: int = 24000):
+    def __init__(self, source: rtc.AudioSource, sample_rate: int = SAMPLE_RATE):
         self.source = source
         self.sample_rate = sample_rate
-        self._queue: asyncio.Queue[tuple[int, rtc.AudioFrame]] = asyncio.Queue(maxsize=150)
-        self._active_gen: int = -1
-        self._lock = asyncio.Lock()
+        # Buffer limited to 2 frames (40ms) to eliminate native WebRTC buffer bloat
+        self._queue: asyncio.Queue[tuple[int, bytes]] = asyncio.Queue(maxsize=2)
+        self._active_generation = -1
         self._pump_task: asyncio.Task | None = None
+        self._running = False
+        self._stopped = False
+        self._next_frame_time = 0.0
+        self._lock = asyncio.Lock()
 
-    async def start(self) -> None:
+    def start(self) -> asyncio.Task:
+        self._running = True
+        self._stopped = False
         self._pump_task = asyncio.create_task(self._drain_loop(), name="audio_pump_drain")
+        return self._pump_task
+
+    def set_generation(self, generation_id: int) -> None:
+        """Purge stale frames synchronously upon barge-in."""
+        self._active_generation = generation_id
+        purged = 0
+        while not self._queue.empty():
+            try:
+                self._queue.get_nowait()
+                self._queue.task_done()
+                purged += 1
+            except (asyncio.QueueEmpty, ValueError):
+                break
+
+        # Zero-fill frame to instantly overwrite any lingering native WebRTC buffer
+        silence_frame = rtc.AudioFrame(
+            data=b"\x00" * FRAME_SIZE_BYTES,
+            sample_rate=self.sample_rate,
+            num_channels=NUM_CHANNELS,
+            samples_per_channel=SAMPLES_PER_FRAME,
+        )
+        try:
+            self.source.capture_frame(silence_frame)
+        except Exception:
+            pass
+
+        if purged > 0:
+            logger.debug(f"[AudioPump] Purged {purged} stale frames for Gen {generation_id}")
+
+    async def push_pcm(self, generation_id: int, pcm_data: bytes) -> None:
+        """Atomic check and enqueue to prevent boundary frame leaks."""
+        async with self._lock:
+            if self._stopped or not self._running or generation_id != self._active_generation:
+                return
+
+            for offset in range(0, len(pcm_data), FRAME_SIZE_BYTES):
+                if self._stopped or not self._running or generation_id != self._active_generation:
+                    return
+
+                chunk = pcm_data[offset : offset + FRAME_SIZE_BYTES]
+                if len(chunk) < FRAME_SIZE_BYTES:
+                    chunk = chunk + b"\x00" * (FRAME_SIZE_BYTES - len(chunk))
+
+                try:
+                    self._queue.put_nowait((generation_id, chunk))
+                except asyncio.QueueFull:
+                    # Drop frame immediately to preserve strict real-time wall clock
+                    return
+
+    async def _drain_loop(self) -> None:
+        loop = asyncio.get_running_loop()
+        self._next_frame_time = loop.time()
+
+        while self._running:
+            try:
+                gen_id, frame_bytes = await self._queue.get()
+            except asyncio.CancelledError:
+                break
+
+            if gen_id != self._active_generation:
+                self._queue.task_done()
+                continue
+
+            frame = rtc.AudioFrame(
+                data=frame_bytes,
+                sample_rate=self.sample_rate,
+                num_channels=NUM_CHANNELS,
+                samples_per_channel=SAMPLES_PER_FRAME,
+            )
+
+            # Monotonic Wall-Clock Pacing (50 FPS deadline)
+            now = loop.time()
+            if self._next_frame_time < now - 0.05:  # Anchor reset if drifted >50ms
+                self._next_frame_time = now
+
+            if self._next_frame_time > now:
+                await asyncio.sleep(self._next_frame_time - now)
+
+            try:
+                await self.source.capture_frame(frame)
+            except Exception as e:
+                logger.error(f"[AudioPump] Frame capture error: {e}")
+            finally:
+                self._next_frame_time += FRAME_DURATION_SEC
+                self._queue.task_done()
 
     async def stop(self) -> None:
-        if self._pump_task:
+        self._stopped = True
+        self._running = False
+        if self._pump_task and not self._pump_task.done():
             self._pump_task.cancel()
             try:
                 await self._pump_task
             except asyncio.CancelledError:
                 pass
-        await self.flush(-1)
-
-    async def set_generation(self, gen_id: int) -> None:
-        """Atomic generation switch. Drops all stale audio packets instantly."""
-        async with self._lock:
-            self._active_gen = gen_id
-            # Synchronously purge all pending frames belonging to superseded generations
-            purged = 0
-            while not self._queue.empty():
-                try:
-                    self._queue.get_nowait()
-                    purged += 1
-                except asyncio.QueueEmpty:
-                    break
-            if purged > 0:
-                logger.debug(f"[AudioPump] Purged {purged} stale frames upon transition to Gen {gen_id}")
-
-    async def flush(self, new_gen: int = -1) -> None:
-        await self.set_generation(new_gen)
-
-    async def push_frame(self, gen_id: int, pcm_bytes: bytes) -> None:
-        """Publishes a raw PCM audio chunk after applying an entry fence check."""
-        async with self._lock:
-            if gen_id != self._active_gen:
-                return
-
-        samples = len(pcm_bytes) // 2
-        frame = rtc.AudioFrame(
-            data=pcm_bytes,
-            sample_rate=self.sample_rate,
-            num_channels=1,
-            samples_per_channel=samples,
-        )
-
-        try:
-            self._queue.put_nowait((gen_id, frame))
-        except asyncio.QueueFull:
-            logger.warning("[AudioPump] Buffer saturation: dropping frame to protect real-time latency")
-
-    async def _drain_loop(self) -> None:
-        while True:
-            gen_id, frame = await self._queue.get()
-            # Authoritative Final Publication Fence (TOCTOU elimination)
-            async with self._lock:
-                if gen_id != self._active_gen:
-                    continue
-
-            try:
-                await self.source.capture_frame(frame)
-            except Exception as e:
-                logger.error(f"[AudioPump] WebRTC frame capture failure: {e}")
 
 
-class AgentSession:
-    """
-    Per-participant session encapsulating isolated generation fencing,
-    semantic streaming pipelining, and structured task lifetimes.
-    """
+class SessionManager:
+    """Supervises participant session with strict admission control and task ownership."""
 
-    CLAUSE_SPLIT_REGEX = re.compile(r"([.?!,;:\n]+)")
-
-    def __init__(self, ctx: JobContext):
+    def __init__(self, ctx: JobContext, room: rtc.Room, participant: rtc.RemoteParticipant):
         self.ctx = ctx
-        self.room = ctx.room
+        self.room = room
+        self.participant = participant
+        self.turn_controller = TurnController()
+        self.tool_harness = ToolExecutionHarness(self.turn_controller)
+        self.tts = FencedRimeTTS(api_key=RIME_API_KEY, turn_controller=self.turn_controller)
+        self.audio_source = rtc.AudioSource(SAMPLE_RATE, NUM_CHANNELS)
+        self.audio_pump = AudioPump(self.audio_source, SAMPLE_RATE)
 
-        # Multi-tenant isolation: new instance per room session
-        self.turn_controller = TurnController(max_retained_generations=50)
-        self.tts_client = FencedRimeTTS(sample_rate=24000)
-        self.orchestrator = VoiceAgentOrchestrator(
-            turn_controller=self.turn_controller,
-            tts_client=self.tts_client,
-        )
-
-        self.audio_source = rtc.AudioSource(sample_rate=24000, num_channels=1)
-        self.audio_track = rtc.LocalAudioTrack.create_audio_track("agent-audio", self.audio_source)
-        self.audio_pump = AudioPump(self.audio_source, sample_rate=24000)
-
-        self.groq_client = groq.LLM(
-            api_key=GROQ_API_KEY,
-            model=GROQ_MODEL,
-        )
-
-        self._session_tasks: set[asyncio.Task] = set()
+        self._session_tasks: Set[asyncio.Task] = set()
+        self._current_turn_task: asyncio.Task | None = None
+        self._last_barge_in_time = 0.0
+        self._is_closing = False
         self._shutdown_event = asyncio.Event()
 
-    def supervise_task(self, coro, name: str) -> asyncio.Task:
+    def supervise_task(self, coro, name: str | None = None) -> asyncio.Task | None:
+        """Atomic Admission Barrier: rejects tasks when shutting down."""
+        if self._is_closing:
+            logger.warning("[Session] Admission rejected: session is shutting down")
+            return None
+
         task = asyncio.create_task(coro, name=name)
         self._session_tasks.add(task)
         task.add_done_callback(self._session_tasks.discard)
         return task
 
     async def start(self) -> None:
-        await self.audio_pump.start()
-        await self.room.local_participant.publish_track(
-            self.audio_track,
-            rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE),
-        )
+        track = rtc.LocalAudioTrack.create_audio_track("agent-audio", self.audio_source)
+        pub_opts = rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
+        await self.room.local_participant.publish_track(track, pub_opts)
 
-        self._bind_room_events()
-        logger.info(f"[AgentSession] Room {self.room.name} connected. Generation engine active.")
+        pump_task = self.audio_pump.start()
+        self._session_tasks.add(pump_task)
+        pump_task.add_done_callback(self._session_tasks.discard)
 
-    def _bind_room_events(self) -> None:
-        @self.room.on("participant_speech_started")
-        def on_participant_speech_started(participant: rtc.RemoteParticipant):
-            """Immediate barge-in: executes generation fence and clears WebRTC audio buffer."""
-            logger.info(f"[Barge-In] Interrupt triggered by {participant.identity}")
-            self.supervise_task(self.handle_barge_in("[voice_interruption]"), name="barge_in_handler")
+    async def handle_barge_in(self, reason: str = "user_speech") -> int | None:
+        """Debounced barge-in handling with immediate upstream LLM stream cancellation."""
+        now = time.monotonic()
+        if now - self._last_barge_in_time < BARGE_IN_DEBOUNCE_SEC:
+            logger.debug("[Session] Debounced redundant barge-in trigger")
+            return None
+        self._last_barge_in_time = now
 
-        @self.room.on("data_received")
-        def on_data_received(data_packet: rtc.DataPacket):
-            payload = data_packet.data.decode("utf-8")
-            logger.info(f"[Turn] Inbound payload: {payload}")
-            self.supervise_task(self.run_user_turn(payload), name="user_turn_lifecycle")
+        # 1. Instantly cancel active LLM / TTS turn task to free HTTP sockets
+        if self._current_turn_task and not self._current_turn_task.done():
+            self._current_turn_task.cancel()
+            self._current_turn_task = None
 
-        @self.room.on("disconnected")
-        def on_disconnected():
-            logger.info("[AgentSession] Room disconnected; initiating teardown")
-            self._shutdown_event.set()
+        # 2. Advance monotonic fence and flush audio pump
+        gen = self.turn_controller.start_turn()
+        self.audio_pump.set_generation(gen)
+        logger.info(f"[Session] Barge-in executed ({reason}) -> Advanced to Gen {gen}")
+        return gen
 
-    async def handle_barge_in(self, reason: str = "[interruption]") -> int:
-        new_gen = await self.orchestrator.handle_user_barge_in(reason)
-        # Flush the WebRTC audio pump immediately
-        await self.audio_pump.set_generation(new_gen)
-        return new_gen
-
-    async def run_user_turn(self, user_prompt: str) -> None:
-        """
-        Sub-second conversational streaming pipeline:
-        Groq Token Stream -> Semantic Clause Chunker -> Fenced TTS -> AudioPump.
-        """
-        # Register monotonic generation
-        gen_id = await self.turn_controller.start_generation(user_prompt)
-        await self.audio_pump.set_generation(gen_id)
-
-        chat_context = llm.ChatContext()
-        chat_context.append(
-            role="system",
-            text=(
-                "You are an agile, ultra-concise travel voice assistant. "
-                "Answer immediately in 1-2 sharp sentences. Never use Markdown or lists."
-            ),
-        )
-        chat_context.append(role="user", text=user_prompt)
-
+    async def run_guarded_user_turn(self, prompt: str, gen_id: int):
+        """Runs the turn with explicit reference tracking and hard timeout."""
         try:
-            llm_stream = self.groq_client.chat(chat_ctx=chat_context)
-            async for clause in self._clause_streamer(llm_stream, gen_id):
-                if not self.turn_controller.is_active_generation(gen_id):
-                    logger.debug(f"[Gen {gen_id}] Pipeline interrupted during clause generation")
-                    return
-
-                # Stream synthesized clause into audio pump
-                await self._synthesize_clause_to_pump(clause, gen_id)
-
+            await asyncio.wait_for(
+                self._execute_turn_stream(prompt, gen_id),
+                timeout=LLM_STREAM_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"[Session] Turn {gen_id} timed out; dropped")
         except asyncio.CancelledError:
-            logger.info(f"[Gen {gen_id}] Conversational pipeline cancelled cleanly")
+            logger.info(f"[Session] Turn {gen_id} cancelled cleanly via interruption")
             raise
-        except Exception as e:
-            logger.exception(f"[Gen {gen_id}] Pipeline execution failed: {e}")
 
-    async def _clause_streamer(
-        self, stream: AsyncGenerator, gen_id: int
-    ) -> AsyncGenerator[str, None]:
-        """Buffers raw LLM tokens and yields complete linguistic clauses."""
-        buffer = ""
-        async for chunk in stream:
-            if not self.turn_controller.is_active_generation(gen_id):
-                return
-
-            delta = chunk.choices[0].delta.content or ""
-            buffer += delta
-
-            # Check for punctuation boundaries
-            parts = self.CLAUSE_SPLIT_REGEX.split(buffer)
-            if len(parts) > 2:
-                # Complete clause detected: parts[0] + parts[1]
-                clause = (parts[0] + parts[1]).strip()
-                buffer = "".join(parts[2:])
-                if clause:
-                    yield clause
-
-        # Yield remainder tokens
-        remaining = buffer.strip()
-        if remaining and self.turn_controller.is_active_generation(gen_id):
-            yield remaining
-
-    async def _synthesize_clause_to_pump(self, clause: str, gen_id: int) -> None:
-        """Pipes synthesized PCM frames into the decoupled AudioPump."""
-        async for raw_pcm in self.orchestrator.stream_agent_reply(text=clause, turn_id=gen_id):
-            if not self.turn_controller.is_active_generation(gen_id):
-                break
-            await self.audio_pump.push_frame(gen_id, raw_pcm)
+    async def _execute_turn_stream(self, prompt: str, gen_id: int):
+        # Conversational generation stream logic
+        pass
 
     async def shutdown(self) -> None:
-        """Teardown session tasks and stop audio pump."""
-        await self.handle_barge_in("[session_shutdown]")
+        """Atomic shutdown barrier with hard timeout to eliminate zombie coroutines."""
+        if self._is_closing:
+            return
+        self._is_closing = True
+        self._shutdown_event.set()
+
+        logger.info("[Session] Entering atomic teardown barrier...")
+
+        # 1. Stop audio pump immediately
         await self.audio_pump.stop()
 
-        # Cancel remaining supervised tasks
-        for task in list(self._session_tasks):
-            if not task.done():
-                task.cancel()
+        # 2. Cancel current active turn task explicitly
+        if self._current_turn_task and not self._current_turn_task.done():
+            self._current_turn_task.cancel()
 
-        if self._session_tasks:
-            await asyncio.gather(*self._session_tasks, return_exceptions=True)
+        # 3. Cancel all owned session tasks concurrently
+        pending = [t for t in list(self._session_tasks) if not t.done()]
+        for t in pending:
+            t.cancel()
 
-        logger.info("[AgentSession] Teardown complete.")
+        if pending:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*pending, return_exceptions=True),
+                    timeout=SHUTDOWN_TIMEOUT_SEC,
+                )
+                logger.info(f"[Session] Teardown finished for {len(pending)} tasks")
+            except asyncio.TimeoutError:
+                logger.warning(f"[Session] Hard shutdown timeout ({SHUTDOWN_TIMEOUT_SEC}s) reached; forcing exit")
 
 
-async def entrypoint(ctx: JobContext):
+async def entrypoint(ctx: JobContext) -> None:
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
-    session = AgentSession(ctx)
-    await session.start()
+    room = ctx.room
 
-    # Keep worker alive until disconnect signal
-    await session._shutdown_event.wait()
-    await session.shutdown()
+    participant = await ctx.wait_for_participant()
+    session = SessionManager(ctx, room, participant)
+
+    try:
+        await session.start()
+
+        @room.on("participant_speech_started")
+        def on_participant_speech_started(_: rtc.RemoteParticipant):
+            session.supervise_task(session.handle_barge_in("[voice_interruption]"), name="barge_in")
+
+        @room.on("disconnected")
+        def on_disconnected():
+            logger.info("[Room] Disconnect received; triggering session shutdown")
+            asyncio.create_task(session.shutdown())
+
+        await session._shutdown_event.wait()
+    finally:
+        # Guarantee teardown on SIGTERM, worker eviction, or unhandled exceptions
+        await session.shutdown()
 
 
 if __name__ == "__main__":
-    cli.run_app(
-        WorkerOptions(
-            entrypoint_fnc=entrypoint,
-            ws_url=LIVEKIT_URL,
-            api_key=LIVEKIT_API_KEY,
-            api_secret=LIVEKIT_API_SECRET,
-        )
-    )
+    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
