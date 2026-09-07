@@ -70,8 +70,25 @@ class MockTravelDB:
         ]
         self.bookings: Dict[str, Dict[str, Any]] = {}
 
+    async def rollback_booking(self, booking_id: str) -> bool:
+        """Compensating transaction to revert a stale, interrupted, or cancelled booking."""
+        async with self._lock:
+            booking = self.bookings.pop(booking_id, None)
+            if not booking:
+                return False
+            flight_id = booking.get("flight_id")
+            for flight in self.flights:
+                if flight.get("flight_id") == flight_id:
+                    flight["available_seats"] += 1
+                    break
+            return True
+
 
 _db = MockTravelDB()
+
+
+def get_mock_db() -> MockTravelDB:
+    return _db
 
 
 def _err(code: str, message: str) -> Dict[str, Any]:
@@ -80,7 +97,7 @@ def _err(code: str, message: str) -> Dict[str, Any]:
 
 async def search_flights(origin: str, destination: str, date: Optional[str] = None) -> Dict[str, Any]:
     """Search for available flights between two airport codes."""
-    await asyncio.sleep(0.3)  # Pre-read network latency
+    await asyncio.sleep(0.3)
 
     results = [
         {
@@ -99,7 +116,7 @@ async def search_flights(origin: str, destination: str, date: Optional[str] = No
     ]
     return {
         "status": "success",
-        "query": {"origin": origin.strip().upper(), "destination": destination.strip().upper(), "date": date},
+        "query": {"origin": origin.strip().upper(), "destination": destination.strip().upper()},
         "count": len(results),
         "flights": results,
     }
@@ -113,10 +130,9 @@ async def book_flight(flight_id: str, passenger_name: str) -> Dict[str, Any]:
     if not clean_name:
         return _err("INVALID_INPUT", "Passenger name cannot be empty.")
 
-    # 1. Simulated transaction latency (safe cancellation window before any mutation)
+    # Simulated transaction latency
     await asyncio.sleep(0.4)
 
-    # 2. Atomic state mutation
     async with _db._lock:
         flight = next((f for f in _db.flights if f["flight_id"] == clean_flight_id), None)
         if not flight:
@@ -150,7 +166,7 @@ async def cancel_booking(booking_id: str) -> Dict[str, Any]:
     """Cancel an existing booking and restore seat inventory atomically."""
     clean_booking_id = booking_id.strip().upper()
 
-    await asyncio.sleep(0.3)  # Cancellation latency
+    await asyncio.sleep(0.3)
 
     async with _db._lock:
         record = _db.bookings.get(clean_booking_id)

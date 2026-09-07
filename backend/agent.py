@@ -1,27 +1,18 @@
-"""
-Agent Orchestrator for dataforge-rime.
-Coordinates turn fencing, task ownership, tool execution harnesses,
-and interruptible TTS streaming with sub-100ms cancellation guarantees.
-"""
-
+from __future__ import annotations
 import asyncio
 import inspect
 import logging
-from typing import Any, AsyncGenerator, Dict, Optional, Set, Union
+from typing import Any, AsyncGenerator, Dict, Optional, Set
 
 from backend.control.turn_controller import TurnController
 from backend.tools.executor import ToolExecutionHarness
 from backend.tts.rime_plugin import FencedRimeTTS
 
-logger = logging.getLogger("dataforge_rime.agent")
+logger = logging.getLogger(__name__)
 
 
 class VoiceAgentOrchestrator:
-    """
-    Manages conversational turn lifecycles, ensuring atomic tool actions
-    and sub-100ms interruption latency through generation fencing and explicit
-    async task lifecycle ownership.
-    """
+    """Production orchestrator combining generation fencing, tools, and TTS streaming."""
 
     def __init__(
         self,
@@ -31,63 +22,62 @@ class VoiceAgentOrchestrator:
     ) -> None:
         self.turn_controller = turn_controller or TurnController()
         self.tool_harness = tool_harness or ToolExecutionHarness()
-        self.tts = tts_client or FencedRimeTTS()
+        self.tts_client = tts_client or FencedRimeTTS()
+        self._state_lock = asyncio.Lock()
         self._current_tts_task: Optional[asyncio.Task] = None
         self._draining_tasks: Set[asyncio.Task] = set()
-        self._state_lock = asyncio.Lock()
 
     def _fence_validator(self, turn_id: int) -> bool:
-        """
-        Synchronously validates whether the given turn_id is the active generation.
-        Directly queries turn_controller without fragile duck-typing or property invocation.
-        """
         return self.turn_controller.validate_generation(turn_id)
 
     async def handle_user_barge_in(self, user_text: str = "[user_interruption]") -> int:
-        """
-        Invoked immediately upon Voice Activity Detection (VAD) trigger.
-        Atomically shifts the generation fence, aborts in-flight tool tasks from
-        the previous generation, and cleanly cancels TTS within an 80ms bounded budget.
-        """
+        """Atomically advance generation fence and claim prior TTS task for draining."""
         async with self._state_lock:
             old_turn_id = self.turn_controller.current_generation_id
-            gen_res = self.turn_controller.start_generation(user_text)
-            new_turn_id = await gen_res if inspect.isawaitable(gen_res) else gen_res
 
-            old_tts_task = self._current_tts_task
+            if old_turn_id != 0:
+                gen_res = self.turn_controller.rollback_invalidated_generation(old_turn_id, user_text)
+                new_turn_id = await gen_res if inspect.isawaitable(gen_res) else gen_res
+            else:
+                gen_res = self.turn_controller.start_generation(user_text)
+                new_turn_id = await gen_res if inspect.isawaitable(gen_res) else gen_res
+
+            # Atomically swap and claim the active TTS task while holding lock
+            task_to_cancel = self._current_tts_task
             self._current_tts_task = None
 
-        # 1. Abort any in-flight tool tasks associated with the invalidated generation
+        # 1. Abort in-flight operations registered for previous turn
         if old_turn_id != 0:
             try:
                 await self.turn_controller.cancel_generation_ops(old_turn_id)
-            except Exception:
-                logger.exception("Error cancelling operations for gen %s", old_turn_id)
+            except Exception as e:
+                logger.warning("Error cancelling ops for generation %d: %s", old_turn_id, e)
 
-        # 2. Cancel and drain the previous generation's TTS task
-        if old_tts_task and not old_tts_task.done():
-            old_tts_task.cancel()
-            self._draining_tasks.add(old_tts_task)
-            old_tts_task.add_done_callback(self._draining_tasks.discard)
+        # 2. Cancel and drain prior TTS task safely outside lock
+        if task_to_cancel and not task_to_cancel.done():
+            task_to_cancel.cancel()
+
+            # Bound draining set to prevent task leakage
+            if len(self._draining_tasks) > 20:
+                self._draining_tasks = {t for t in self._draining_tasks if not t.done()}
+
+            self._draining_tasks.add(task_to_cancel)
+            task_to_cancel.add_done_callback(self._draining_tasks.discard)
+
             try:
-                await asyncio.wait_for(old_tts_task, timeout=0.08)
-            except asyncio.CancelledError:
+                await asyncio.wait_for(asyncio.shield(task_to_cancel), timeout=0.08)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
                 pass
-            except asyncio.TimeoutError:
-                logger.warning("TTS task did not finish teardown within 80ms budget; draining in background")
-            except Exception:
-                logger.exception("Unexpected error during TTS task teardown")
 
-        logger.info("Barge-in handled. Old gen: %s -> New gen: %s", old_turn_id, new_turn_id)
-        return int(new_turn_id)
+        return new_turn_id
 
     async def execute_tool_call(
-        self, tool_name: str, arguments: Dict[str, Any], turn_id: int
+        self,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        turn_id: int,
     ) -> Dict[str, Any]:
-        """
-        Executes a registered tool within the generation fence boundary.
-        Delegates completely to ToolExecutionHarness with TurnController tracking.
-        """
+        """Execute a tool wrapped with pre/post fence validation and state compensation."""
         return await self.tool_harness.execute_tool(
             tool_name=tool_name,
             arguments=arguments,
@@ -97,43 +87,38 @@ class VoiceAgentOrchestrator:
         )
 
     async def stream_agent_reply(
-        self, text: str, turn_id: int, chunk_latency_ms: int = 20
-    ) -> AsyncGenerator[Union[bytes, Any], None]:
-        """
-        Streams synthesized audio frames under generation fencing.
-        Safely registers the active TTS task and rejects stale or duplicate streams.
-        """
-        if not text or not text.strip():
-            return
-
-        # Pre-execution check: turn must be strictly active before initiating stream
-        if not self._fence_validator(turn_id):
-            logger.warning("Rejecting stream_agent_reply: generation %s is not active", turn_id)
-            return
-
+        self,
+        text: str,
+        turn_id: int,
+        chunk_latency_ms: int = 20,
+    ) -> AsyncGenerator[bytes, None]:
+        """Stream synthesized audio frames guarded by the generation fence."""
         current_task = asyncio.current_task()
+        task_to_displace = None
+
         async with self._state_lock:
+            # Drop obsolete stream before starting
             if not self._fence_validator(turn_id):
                 return
-            # If an existing TTS task is running, cancel it cleanly before registering the new one
-            if self._current_tts_task and not self._current_tts_task.done() and self._current_tts_task is not current_task:
-                self._current_tts_task.cancel()
-            self._current_tts_task = current_task
+
+            # Cancel and displace any previous active TTS stream
+            if self._current_tts_task and self._current_tts_task is not current_task:
+                task_to_displace = self._current_tts_task
+
+            if current_task:
+                self._current_tts_task = current_task
+
+        if task_to_displace and not task_to_displace.done():
+            task_to_displace.cancel()
 
         try:
-            async for frame in self.tts.stream_speech(
+            async for frame in self.tts_client.stream_speech(
                 text=text,
                 turn_id=turn_id,
                 fence_validator=self._fence_validator,
                 chunk_latency_ms=chunk_latency_ms,
             ):
-                # Final publication fence check right before yielding to external sink
-                if not self._fence_validator(turn_id):
-                    break
                 yield frame
-        except asyncio.CancelledError:
-            logger.info("stream_agent_reply cancelled for turn %s", turn_id)
-            raise
         finally:
             async with self._state_lock:
                 if self._current_tts_task is current_task:

@@ -1,154 +1,168 @@
-"""
-Async tool execution harness with generation fencing, latency timeouts,
-execution latency profiling, cancellation boundaries, and TurnController registration.
-"""
-
+from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import re
 import time
-from typing import Any, Awaitable, Callable, Dict, Optional, Union
+from typing import Any, Callable, Dict, Optional
 
-from backend.tools.registry import (
-    InvalidToolArgumentsError,
-    ToolNotFoundError,
-    get_tool_handler,
-    get_tool_metadata,
-    validate_tool_arguments,
-)
+from backend.tools.registry import TOOL_DEFINITIONS, TOOL_METADATA, TOOL_HANDLERS
+from backend.tools.mock_tools import get_mock_db
 
-logger = logging.getLogger("dataforge_rime.tools.executor")
-
-FenceValidator = Callable[[int], Union[bool, Awaitable[bool]]]
+logger = logging.getLogger(__name__)
 
 
 class ToolExecutionHarness:
-    """
-    Executes travel operation tools wrapped with generation fence verification
-    and timeout budgets.
-    """
+    """Production-hardened tool execution harness."""
 
-    @staticmethod
-    def _err(code: str, message: str, operation: str) -> Dict[str, Any]:
-        return {
-            "status": "error",
-            "error_code": code,
-            "message": message,
-            "operation": operation,
-        }
-
-    @staticmethod
-    def _cancelled(operation: str, reason: str, turn_id: int) -> Dict[str, Any]:
-        return {
-            "status": "cancelled",
-            "operation": operation,
-            "reason": reason,
-            "turn_id": turn_id,
-            "message": "Tool execution was cancelled or superseded by turn controller.",
-        }
+    def __init__(self, timeout_padding_ms: int = 200):
+        self.timeout_padding_ms = timeout_padding_ms
 
     async def _check_fence(
-        self, validator: Optional[FenceValidator], turn_id: int, operation: str
+        self,
+        fence_validator: Optional[Callable[[int], Any]],
+        turn_id: int,
+        tool_name: str,
+        stage: str = "check",
     ) -> bool:
-        """Evaluate fence validator safely across sync and async callables."""
-        if validator is None:
+        if not fence_validator:
             return True
         try:
-            res = validator(turn_id)
+            res = fence_validator(turn_id)
             if inspect.isawaitable(res):
                 res = await res
             return bool(res)
-        except Exception as exc:
-            logger.warning(
-                "Fence validator exception on tool '%s' (turn %s): %s",
-                operation,
-                turn_id,
-                exc,
-            )
+        except Exception as e:
+            logger.error("[FENCE] Error during %s fence check for '%s': %s", stage, tool_name, e)
             return False
+
+    def validate_tool_arguments(self, tool_name: str, arguments: Dict[str, Any]) -> Optional[str]:
+        schema_def = next((t for t in TOOL_DEFINITIONS if t.get("name") == tool_name), None)
+        if not schema_def:
+            return None
+
+        params = schema_def.get("parameters", {})
+        properties = params.get("properties", {})
+        required = params.get("required", [])
+
+        for req in required:
+            if req not in arguments:
+                return f"Missing required parameter '{req}'"
+
+        if not params.get("additionalProperties", True):
+            for key in arguments:
+                if key not in properties:
+                    return f"Unexpected property '{key}' not permitted by schema"
+
+        for key, val in arguments.items():
+            if key not in properties:
+                continue
+            prop_spec = properties[key]
+            expected_type = prop_spec.get("type")
+
+            if expected_type == "string":
+                if not isinstance(val, str):
+                    return f"Parameter '{key}' must be a string"
+                pattern = prop_spec.get("pattern")
+                if pattern and not re.match(pattern, val):
+                    return f"Parameter '{key}' does not match pattern '{pattern}'"
+            elif expected_type == "integer":
+                if not isinstance(val, int) or isinstance(val, bool):
+                    return f"Parameter '{key}' must be an integer"
+                min_val = prop_spec.get("minimum")
+                max_val = prop_spec.get("maximum")
+                if min_val is not None and val < min_val:
+                    return f"Parameter '{key}' must be >= {min_val}"
+                if max_val is not None and val > max_val:
+                    return f"Parameter '{key}' must be <= {max_val}"
+
+        return None
+
+    async def _compensate_side_effect(self, tool_name: str, result: Dict[str, Any]) -> None:
+        if tool_name == "book_flight" and isinstance(result, dict) and result.get("status") == "success":
+            booking = result.get("booking", {})
+            booking_id = booking.get("booking_id")
+            if booking_id:
+                logger.warning("[COMPENSATION] Rolling back flight booking %s due to fence expiry", booking_id)
+                db = get_mock_db()
+                await db.rollback_booking(booking_id)
 
     async def execute_tool(
         self,
         tool_name: str,
         arguments: Dict[str, Any],
         turn_id: int,
-        fence_validator: Optional[FenceValidator] = None,
+        fence_validator: Optional[Callable[[int], Any]] = None,
         turn_controller: Optional[Any] = None,
     ) -> Dict[str, Any]:
-        """
-        Safely execute a tool with generation fencing, timeout enforcement,
-        TurnController registration, and latency tracking.
-        """
+        meta = TOOL_METADATA.get(tool_name, {})
+        max_lat = meta.get("max_latency_ms", 1500)
+        timeout_sec = (max_lat + self.timeout_padding_ms) / 1000.0
         start_time = time.perf_counter()
 
-        # 1. Pre-execution generation fence check
-        is_fresh = await self._check_fence(fence_validator, turn_id, tool_name)
-        if not is_fresh:
-            logger.info("Tool '%s' cancelled: pre-execution fence failed for turn %s", tool_name, turn_id)
-            return self._cancelled(tool_name, "pre_execution_fence_failed", turn_id)
+        # 1. Pre-execution fence check
+        if not await self._check_fence(fence_validator, turn_id, tool_name, stage="pre"):
+            return {
+                "status": "cancelled",
+                "reason": "pre_execution_fence_failed",
+                "error_code": "TURN_SUPERSEDED_PRE_EXECUTION",
+                "message": f"Tool '{tool_name}' dropped: Turn {turn_id} superseded before execution started.",
+            }
 
-        # 2. Handler & metadata lookup
-        try:
-            handler = get_tool_handler(tool_name)
-            meta = get_tool_metadata(tool_name)
-        except ToolNotFoundError as exc:
-            return self._err("TOOL_NOT_FOUND", str(exc), tool_name)
+        # 2. Schema check
+        val_err = self.validate_tool_arguments(tool_name, arguments)
+        if val_err:
+            return {
+                "status": "error",
+                "error_code": "INVALID_ARGUMENTS",
+                "message": val_err,
+            }
 
-        # 3. Parameter validation
-        try:
-            validate_tool_arguments(tool_name, arguments)
-        except InvalidToolArgumentsError as exc:
-            return self._err("INVALID_ARGUMENTS", str(exc), tool_name)
+        handler = TOOL_HANDLERS.get(tool_name)
+        if not handler:
+            return {
+                "status": "error",
+                "error_code": "TOOL_NOT_FOUND",
+                "message": f"No handler registered for '{tool_name}'.",
+            }
 
-        # 4. Latency budget configuration
-        timeout_sec = meta.get("max_latency_ms", 1500) / 1000.0
-
-        # 5. Execution within timeout, registration, and cancellation boundary
-        current_task = asyncio.current_task()
-        op_id = None
-        if turn_controller and current_task:
-            try:
-                op_id = turn_controller.register_operation(
-                    gen_id=turn_id,
-                    kind=f"tool_{tool_name}",
-                    coro_or_task=current_task,
-                )
-            except Exception as e:
-                logger.warning("Failed to register tool '%s' with TurnController: %s", tool_name, e)
-
+        # 3. Timed execution
         try:
             async with asyncio.timeout(timeout_sec):
                 result = await handler(**arguments)
         except asyncio.TimeoutError:
-            elapsed_ms = round((time.perf_counter() - start_time) * 1000, 2)
-            logger.warning("Tool '%s' exceeded timeout of %ss (elapsed: %sms)", tool_name, timeout_sec, elapsed_ms)
-            return self._err(
-                "EXECUTION_TIMEOUT",
-                f"Tool '{tool_name}' exceeded timeout budget of {timeout_sec}s.",
-                tool_name,
-            )
+            return {
+                "status": "error",
+                "error_code": "EXECUTION_TIMEOUT",
+                "message": f"Tool '{tool_name}' timed out after {timeout_sec:.2f}s.",
+            }
         except asyncio.CancelledError:
-            logger.info("Tool '%s' received task cancellation during execution for turn %s", tool_name, turn_id)
             raise
         except Exception as exc:
-            logger.exception("Unhandled failure executing tool '%s' on turn %s", tool_name, turn_id)
-            return self._err("EXECUTION_FAILED", f"Unexpected tool failure: {exc}", tool_name)
+            return {
+                "status": "error",
+                "error_code": "EXECUTION_FAILED",
+                "message": str(exc),
+            }
 
-        # 6. Post-execution fence check
-        is_fresh_post = await self._check_fence(fence_validator, turn_id, tool_name)
-        if not is_fresh_post:
-            logger.info("Tool '%s' cancelled: post-execution fence failed for turn %s", tool_name, turn_id)
-            return self._cancelled(tool_name, "post_execution_fence_failed", turn_id)
+        # 4. Post-execution fence check with compensation
+        if not await self._check_fence(fence_validator, turn_id, tool_name, stage="post"):
+            if meta.get("mutates_state", False):
+                await self._compensate_side_effect(tool_name, result)
+            return {
+                "status": "cancelled",
+                "reason": "post_execution_fence_failed",
+                "error_code": "TURN_SUPERSEDED_POST_EXECUTION",
+                "message": f"Tool '{tool_name}' completed, but Turn {turn_id} was superseded. Result discarded.",
+            }
 
-        # 7. Attach execution metadata for turn binding
-        elapsed_ms = round((time.perf_counter() - start_time) * 1000, 2)
-        if not isinstance(result, dict):
-            result = {"result": result}
-
-        result["_meta"] = {
-            "turn_id": turn_id,
-            "tool_name": tool_name,
-            "execution_time_ms": elapsed_ms,
-        }
+        # Attach execution metadata
+        duration_ms = (time.perf_counter() - start_time) * 1000
+        if isinstance(result, dict):
+            result["_meta"] = {
+                "turn_id": turn_id,
+                "tool_name": tool_name,
+                "duration_ms": round(duration_ms, 2),
+            }
 
         return result

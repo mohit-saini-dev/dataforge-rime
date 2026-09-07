@@ -8,7 +8,7 @@ import inspect
 import logging
 from typing import Any, AsyncGenerator, Awaitable, Callable, Optional, Union
 
-# Conditionally import LiveKit WebRTC types for seamless local testing fallback
+# conditionally import LiveKit WebRTC types for seamless local testing fallback
 try:
     from livekit import rtc
     HAS_LIVEKIT = True
@@ -77,7 +77,7 @@ class FencedRimeTTS:
         as_audio_frame: bool = False,
     ) -> AsyncGenerator[Union[bytes, Any], None]:
         """
-        Yield synthetic audio frames chunk-by-chunk with generation fence boundary checks.
+        Yield synthetic audio frames chunk by chunk with generation fence boundary checks.
 
         Args:
             text: Text to synthesize.
@@ -97,11 +97,11 @@ class FencedRimeTTS:
 
         # 20ms frame chunk (960 bytes for 24kHz mono PCM16)
         raw_frame = b"\x00" * self.frame_bytes
-        total_chunks = max(1, len(clean_text.split()) * 2)
+        total_chunks = max(1, len(clean_text.split())) * 2
 
         try:
             for chunk_idx in range(total_chunks):
-                # 2. Per-chunk fence evaluation
+                # 2. Pre-sleep chunk fence evaluation
                 if not await self._is_fence_active(fence_validator, turn_id):
                     logger.info(
                         "TTS cut off mid-stream at chunk %d/%d for turn %s",
@@ -112,6 +112,16 @@ class FencedRimeTTS:
                     break
 
                 await asyncio.sleep(chunk_latency_ms / 1000.0)
+
+                # 3. Pre-yield TOCTOU check: verify fence freshness after latency sleep
+                if not await self._is_fence_active(fence_validator, turn_id):
+                    logger.info(
+                        "TTS TOCTOU cutoff at chunk %d/%d for turn %s (interrupted during synthesis sleep)",
+                        chunk_idx + 1,
+                        total_chunks,
+                        turn_id,
+                    )
+                    break
 
                 if as_audio_frame:
                     yield self.create_audio_frame(raw_frame)
