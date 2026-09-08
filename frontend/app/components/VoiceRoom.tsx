@@ -4,118 +4,175 @@ import { useEffect, useRef, useState } from "react";
 import {
   LiveKitRoom,
   RoomAudioRenderer,
+  DisconnectButton,
+  useIsSpeaking,
   useLocalParticipant,
   useVoiceAssistant,
-  useIsSpeaking,
 } from "@livekit/components-react";
 import "@livekit/components-styles";
-import { TurnStateBadge, TurnState } from "./TurnStateBadge";
+import { TurnStateBadge } from "./TurnStateBadge";
 
-const LIVEKIT_URL =
-  process.env.NEXT_PUBLIC_LIVEKIT_URL ?? "ws://localhost:7880";
+export type TurnState = "listening" | "thinking" | "speaking" | "interrupted";
 
-export function VoiceRoom() {
-  const [token, setToken] = useState<string | null>(null);
-  const [connecting, setConnecting] = useState(false);
+const INTERRUPTION_DISPLAY_MS = 1500;
+const BARGE_IN_GRACE_MS = 250;
+
+export function useBargeInTurnState(): TurnState {
+  const { state: agentState } = useVoiceAssistant();
+  const { localParticipant } = useLocalParticipant();
+  const isUserSpeaking = useIsSpeaking(localParticipant);
+
+  const [interrupted, setInterrupted] = useState(false);
+
+  const prevAgentSpeaking = useRef(agentState === "speaking");
+  const prevUserSpeaking = useRef(isUserSpeaking);
+  const agentStoppedAt = useRef<number | null>(null);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const triggerInterruption = () => {
+    setInterrupted(true);
+    if (timerRef.current) clearTimeout(timerRef.current);
+    timerRef.current = setTimeout(() => {
+      setInterrupted(false);
+      timerRef.current = null;
+    }, INTERRUPTION_DISPLAY_MS);
+  };
+
+  useEffect(() => {
+    const agentSpeaking = agentState === "speaking";
+    const userSpeaking = isUserSpeaking;
+
+    const wasAgentSpeaking = prevAgentSpeaking.current;
+    const wasUserSpeaking = prevUserSpeaking.current;
+
+    const agentStoppedSpeaking = wasAgentSpeaking && !agentSpeaking;
+    const userStartedSpeaking = !wasUserSpeaking && userSpeaking;
+    const agentStartedSpeaking = !wasAgentSpeaking && agentSpeaking;
+
+    // Edge 1: User starts speaking while agent is active
+    if (userStartedSpeaking && agentSpeaking) {
+      triggerInterruption();
+    }
+
+    // Edge 2: Agent cuts off while user is speaking
+    if (agentStoppedSpeaking && userSpeaking) {
+      agentStoppedAt.current = performance.now();
+      triggerInterruption();
+    }
+
+    // Edge 3: User starts speaking within the grace window after agent cut off
+    if (userStartedSpeaking && !agentSpeaking) {
+      const stoppedAt = agentStoppedAt.current;
+      if (stoppedAt !== null && performance.now() - stoppedAt <= BARGE_IN_GRACE_MS) {
+        triggerInterruption();
+      }
+    }
+
+    if (agentStartedSpeaking) {
+      agentStoppedAt.current = null;
+    }
+
+    // Advance refs unconditionally
+    prevAgentSpeaking.current = agentSpeaking;
+    prevUserSpeaking.current = userSpeaking;
+  }, [agentState, isUserSpeaking]);
+
+  useEffect(() => {
+    return () => {
+      if (timerRef.current) clearTimeout(timerRef.current);
+    };
+  }, []);
+
+  if (interrupted) return "interrupted";
+  if (agentState === "speaking") return "speaking";
+  if (agentState === "thinking") return "thinking";
+  return "listening";
+}
+
+function RoomContent() {
+  const turnState = useBargeInTurnState();
+
+  return (
+    <div className="flex flex-col items-center justify-center gap-6 p-6">
+      <TurnStateBadge state={turnState} />
+      <RoomAudioRenderer />
+      <DisconnectButton className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white text-sm font-medium rounded-lg transition-colors">
+        Leave Session
+      </DisconnectButton>
+    </div>
+  );
+}
+
+interface VoiceRoomProps {
+  roomName?: string;
+  participantName?: string;
+}
+
+export default function VoiceRoom({
+  roomName = "default-room",
+  participantName = `user-${Math.floor(Math.random() * 10000)}`,
+}: VoiceRoomProps) {
+  const [token, setToken] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
 
-  async function handleConnect() {
-    setConnecting(true);
-    setError(null);
-    try {
-      const identity = "user-" + Math.random().toString(36).slice(2, 8);
-      const res = await fetch(
-        `/api/token?room=voice-room&identity=${identity}`
-      );
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        throw new Error(body.error ?? `HTTP ${res.status}`);
+  const serverUrl = process.env.NEXT_PUBLIC_LIVEKIT_URL;
+
+  useEffect(() => {
+    let isMounted = true;
+
+    async function fetchToken() {
+      try {
+        const res = await fetch(
+          `/api/token?room=${encodeURIComponent(roomName)}&username=${encodeURIComponent(participantName)}`
+        );
+        if (!res.ok) {
+          throw new Error(`Failed to fetch room token: ${res.statusText}`);
+        }
+        const data = await res.json();
+        if (isMounted) {
+          setToken(data.token);
+        }
+      } catch (err) {
+        if (isMounted) {
+          setError(err instanceof Error ? err.message : "Unknown token error");
+        }
       }
-      const { token: jwt } = await res.json();
-      setToken(jwt);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setConnecting(false);
     }
+
+    fetchToken();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [roomName, participantName]);
+
+  if (error) {
+    return (
+      <div className="p-4 bg-red-900/40 border border-red-500 rounded-lg text-red-200 text-sm">
+        {error}
+      </div>
+    );
   }
 
-  if (!token) {
+  if (!token || !serverUrl) {
     return (
-      <div className="flex flex-col items-center justify-center gap-6">
-        <h1 className="text-3xl font-semibold tracking-tight text-zinc-900 dark:text-zinc-50">
-          Voice Assistant
-        </h1>
-        {error && (
-          <p className="text-sm text-red-600 dark:text-red-400">{error}</p>
-        )}
-        <button
-          onClick={handleConnect}
-          disabled={connecting}
-          className="px-6 py-3 rounded-full bg-zinc-900 text-white text-sm font-medium hover:bg-zinc-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors dark:bg-zinc-50 dark:text-zinc-900 dark:hover:bg-zinc-200"
-        >
-          {connecting ? "Connecting…" : "Start Session"}
-        </button>
+      <div className="flex items-center gap-2 text-zinc-400 text-sm">
+        <span className="w-2 h-2 rounded-full bg-zinc-500 animate-pulse" />
+        Connecting to session...
       </div>
     );
   }
 
   return (
     <LiveKitRoom
-      serverUrl={LIVEKIT_URL}
       token={token}
+      serverUrl={serverUrl}
+      connect={true}
       audio={true}
       video={false}
-      className="flex flex-col flex-1 items-center justify-center w-full"
-      onDisconnected={() => setToken(null)}
+      className="flex flex-col items-center justify-center min-h-[300px] w-full"
     >
-      <RoomAudioRenderer />
       <RoomContent />
     </LiveKitRoom>
-  );
-}
-
-function RoomContent() {
-  const { state: agentState } = useVoiceAssistant();
-  const { localParticipant } = useLocalParticipant();
-  const isUserSpeaking = useIsSpeaking(localParticipant);
-
-  // Track when agent transitions out of "speaking" while user is talking → interrupted
-  const prevAgentState = useRef(agentState);
-  const [interrupted, setInterrupted] = useState(false);
-
-  useEffect(() => {
-    if (
-      prevAgentState.current === "speaking" &&
-      agentState !== "speaking" &&
-      isUserSpeaking
-    ) {
-      setInterrupted(true);
-      const timer = setTimeout(() => setInterrupted(false), 1500);
-      return () => clearTimeout(timer);
-    }
-    prevAgentState.current = agentState;
-  }, [agentState, isUserSpeaking]);
-
-  const turnState: TurnState = interrupted
-    ? "interrupted"
-    : agentState === "speaking"
-    ? "speaking"
-    : agentState === "thinking"
-    ? "thinking"
-    : "listening";
-
-  return (
-    <div className="flex flex-col items-center gap-8">
-      <h1 className="text-3xl font-semibold tracking-tight text-zinc-900 dark:text-zinc-50">
-        Voice Assistant
-      </h1>
-
-      <TurnStateBadge state={turnState} />
-
-      <p className="text-sm text-zinc-500 dark:text-zinc-400">
-        {isUserSpeaking ? "You are speaking…" : "Mic active — say something"}
-      </p>
-    </div>
   );
 }
