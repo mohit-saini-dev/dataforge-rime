@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   LiveKitRoom,
   RoomAudioRenderer,
@@ -91,12 +91,18 @@ export function useBargeInTurnState(): TurnState {
 
 function RoomContent() {
   const turnState = useBargeInTurnState();
+  const { state: rawAgentState, audioTrack } = useVoiceAssistant();
+
+  useEffect(() => {
+    console.log("[LiveKit] Current Raw Agent State:", rawAgentState);
+    console.log("[LiveKit] Remote Audio Track Publication:", audioTrack);
+  }, [rawAgentState, audioTrack]);
 
   return (
     <div className="flex flex-col items-center justify-center gap-6 p-6">
       <TurnStateBadge state={turnState} />
       <RoomAudioRenderer />
-      <DisconnectButton className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white text-sm font-medium rounded-lg transition-colors">
+      <DisconnectButton className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white text-sm rounded transition-colors">
         Leave Session
       </DisconnectButton>
     </div>
@@ -110,10 +116,16 @@ interface VoiceRoomProps {
 
 export default function VoiceRoom({
   roomName = "default-room",
-  participantName = `user-${Math.floor(Math.random() * 10000)}`,
+  participantName: propParticipantName,
 }: VoiceRoomProps) {
   const [token, setToken] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
+
+  // Stable memoized identity prevents component re-render loops
+  const participantName = useMemo(
+    () => propParticipantName || `user-${Math.floor(Math.random() * 10000)}`,
+    [propParticipantName]
+  );
 
   const serverUrl = process.env.NEXT_PUBLIC_LIVEKIT_URL;
 
@@ -123,7 +135,7 @@ export default function VoiceRoom({
     async function fetchToken() {
       try {
         const res = await fetch(
-          `/api/token?room=${encodeURIComponent(roomName)}&username=${encodeURIComponent(participantName)}`
+          `/api/token?room=${encodeURIComponent(roomName)}&identity=${encodeURIComponent(participantName)}`
         );
         if (!res.ok) {
           throw new Error(`Failed to fetch room token: ${res.statusText}`);
@@ -171,6 +183,9 @@ export default function VoiceRoom({
       audio={true}
       video={false}
       className="flex flex-col items-center justify-center min-h-[300px] w-full"
+      onConnected={() => console.log("[LiveKit] Room connected successfully")}
+      onDisconnected={(reason) => console.log("[LiveKit] Room disconnected:", reason)}
+      onError={(err) => console.error("[LiveKit] Room error:", err)}
     >
       <RoomContent />
     </LiveKitRoom>

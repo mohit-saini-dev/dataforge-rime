@@ -1,7 +1,7 @@
+"use client";
+
 import dynamic from "next/dynamic";
 
-// WebRTC APIs (navigator.mediaDevices, RTCPeerConnection) fail during server pre-rendering.
-// Disabling SSR guarantees execution solely in the browser environment.
 const VoiceRoom = dynamic(() => import("./components/VoiceRoom"), {
   ssr: false,
   loading: () => (
@@ -14,8 +14,11 @@ const VoiceRoom = dynamic(() => import("./components/VoiceRoom"), {
 
 export default function Home() {
   return (
-    <main className="flex min-h-screen flex-col items-center justify-center bg-zinc-50 dark:bg-black p-4">
-      <VoiceRoom />
+    <main className="min-h-screen bg-zinc-950 flex flex-col items-center justify-center p-6 text-white">
+      <div className="w-full max-w-xl flex flex-col items-center gap-6">
+        <h1 className="text-2xl font-semibold tracking-tight">Voice Agent Playground</h1>
+        <VoiceRoom />
+      </div>
     </main>
   );
 }
