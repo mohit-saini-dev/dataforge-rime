@@ -1,4 +1,4 @@
-import { AccessToken } from "livekit-server-sdk";
+import { AccessToken, TrackSource } from "livekit-server-sdk";
 import { NextRequest, NextResponse } from "next/server";
 
 export const dynamic = "force-dynamic";
@@ -54,7 +54,7 @@ export async function GET(req: NextRequest) {
       roomJoin: true,
       room,
       canPublish: true,
-      canPublishSources: ["microphone"], // Restrict track publication to mic only
+      canPublishSources: [TrackSource.MICROPHONE],
       canSubscribe: true,
       canPublishData: true,
     });
