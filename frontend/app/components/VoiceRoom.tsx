@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   BarVisualizer,
   DisconnectButton,
@@ -16,9 +16,6 @@ import { ConnectionState, Track } from "livekit-client";
 import "@livekit/components-styles";
 import { TurnStateBadge, TurnState } from "./TurnStateBadge";
 import { TranscriptFeed } from "./TranscriptFeed";
-
-const LIVEKIT_URL =
-  process.env.NEXT_PUBLIC_LIVEKIT_URL ?? "ws://localhost:7880";
 
 // ---------------------------------------------------------------------------
 // Pre-connect: check browser mic permission without triggering a prompt
@@ -38,10 +35,12 @@ async function getMicPermissionState(): Promise<PermissionState | "unsupported">
 // ---------------------------------------------------------------------------
 // Root export
 // ---------------------------------------------------------------------------
-export function VoiceRoom() {
+export default function VoiceRoom() {
   const [token, setToken] = useState<string | null>(null);
   const [connecting, setConnecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const serverUrl = process.env.NEXT_PUBLIC_LIVEKIT_URL;
 
   async function handleConnect() {
     setConnecting(true);
@@ -65,10 +64,10 @@ export function VoiceRoom() {
         const body = await res.json().catch(() => ({}));
         throw new Error(body.error ?? `HTTP ${res.status}`);
       }
-      const { token: jwt } = await res.json();
-      setToken(jwt);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      const data = await res.json();
+      setToken(data.token);
+    } catch (err: any) {
+      setError(err?.message ?? "Failed to connect to voice room");
     } finally {
       setConnecting(false);
     }
@@ -87,9 +86,9 @@ export function VoiceRoom() {
         <button
           onClick={handleConnect}
           disabled={connecting}
-          className="px-6 py-3 rounded-full bg-zinc-900 text-white text-sm font-medium hover:bg-zinc-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors dark:bg-zinc-50 dark:text-zinc-900 dark:hover:bg-zinc-200"
+          className="px-6 py-3 rounded-full bg-zinc-900 text-white text-sm font-medium hover:bg-zinc-700 disabled:opacity-50 disabled:cursor-not-allowed transition-opacity"
         >
-          {connecting ? "Connecting…" : "Start Session"}
+          {connecting ? "Connecting..." : "Start Session"}
         </button>
       </div>
     );
@@ -97,14 +96,14 @@ export function VoiceRoom() {
 
   return (
     <LiveKitRoom
-      serverUrl={LIVEKIT_URL}
       token={token}
+      serverUrl={serverUrl}
+      connect={true}
       audio={true}
       video={false}
       className="flex flex-col flex-1 items-center justify-center w-full"
       onDisconnected={() => setToken(null)}
       onError={(err) => {
-        // Surface mic permission denials that surface after connecting
         const msg = err.message.toLowerCase();
         if (
           msg.includes("notallowederror") ||
@@ -129,8 +128,7 @@ export function VoiceRoom() {
 // ---------------------------------------------------------------------------
 function RoomContent({ onLeave }: { onLeave: () => void }) {
   const connectionState = useConnectionState();
-  const { state: agentState, audioTrack: agentAudioTrack } =
-    useVoiceAssistant();
+  const { state: agentState, audioTrack: agentAudioTrack } = useVoiceAssistant();
   const { localParticipant } = useLocalParticipant();
   const isUserSpeaking = useIsSpeaking(localParticipant);
 
@@ -171,11 +169,10 @@ function RoomContent({ onLeave }: { onLeave: () => void }) {
 
   return (
     <div className="flex flex-col items-center gap-5 w-full max-w-lg px-6 py-8">
-
-      {/* ── Connection health banner ── */}
+      {/* Connection health banner */}
       {connectionState === ConnectionState.Reconnecting && (
-        <div className="w-full px-4 py-2.5 rounded-lg bg-yellow-50 border border-yellow-200 text-yellow-800 text-sm text-center dark:bg-yellow-950 dark:border-yellow-800 dark:text-yellow-300">
-          Connection lost — reconnecting…
+        <div className="w-full px-4 py-2.5 rounded-lg bg-yellow-50 border border-yellow-200 text-yellow-800 text-sm text-center dark:bg-yellow-950 dark:border-yellow-800 dark:text-yellow-200">
+          Connection lost — reconnecting...
         </div>
       )}
 
@@ -183,7 +180,7 @@ function RoomContent({ onLeave }: { onLeave: () => void }) {
         Voice Assistant
       </h1>
 
-      {/* ── Agent audio visualizer ── */}
+      {/* Agent audio visualizer */}
       <section className="flex flex-col items-center gap-2 w-full">
         <span className="text-xs font-semibold uppercase tracking-widest text-zinc-400 dark:text-zinc-600">
           Agent
@@ -194,9 +191,7 @@ function RoomContent({ onLeave }: { onLeave: () => void }) {
               trackRef={agentAudioTrack}
               barCount={24}
               className="w-full h-full"
-              style={
-                { "--lk-fg": "rgb(59 130 246)" } as React.CSSProperties
-              }
+              style={{ "--lk-fg": "rgb(59 130 246)" } as React.CSSProperties}
             />
           ) : (
             <FlatBars count={24} className="bg-blue-200 dark:bg-blue-900" />
@@ -205,10 +200,10 @@ function RoomContent({ onLeave }: { onLeave: () => void }) {
         <TurnStateBadge state={turnState} />
       </section>
 
-      {/* ── Rolling transcript ── */}
+      {/* Rolling transcript */}
       <TranscriptFeed />
 
-      {/* ── Local mic visualizer ── */}
+      {/* Local mic visualizer */}
       <section className="flex flex-col items-center gap-2 w-full">
         <span className="text-xs font-semibold uppercase tracking-widest text-zinc-400 dark:text-zinc-600">
           You
@@ -219,9 +214,7 @@ function RoomContent({ onLeave }: { onLeave: () => void }) {
               trackRef={localMicRef}
               barCount={14}
               className="w-full h-full"
-              style={
-                { "--lk-fg": "rgb(34 197 94)" } as React.CSSProperties
-              }
+              style={{ "--lk-fg": "rgb(34 197 94)" } as React.CSSProperties}
             />
           ) : (
             <FlatBars count={14} className="bg-green-200 dark:bg-green-900" />
@@ -229,7 +222,7 @@ function RoomContent({ onLeave }: { onLeave: () => void }) {
         </div>
       </section>
 
-      {/* ── Controls ── */}
+      {/* Controls */}
       <div className="flex items-center gap-3 mt-1">
         <TrackToggle
           source={Track.Source.Microphone}
@@ -267,7 +260,7 @@ function FlatBars({ count, className }: { count: number; className: string }) {
 
 function ErrorBanner({ message }: { message: string }) {
   return (
-    <div className="flex items-start gap-3 px-4 py-3 rounded-lg bg-red-50 border border-red-200 text-red-700 dark:bg-red-950 dark:border-red-800 dark:text-red-300 text-sm max-w-sm">
+    <div className="flex items-start gap-3 px-4 py-3 rounded-lg bg-red-50 border border-red-200 text-red-700 dark:bg-red-950 dark:border-red-800 dark:text-red-200 text-sm max-w-md">
       <span className="shrink-0 mt-0.5 font-bold">!</span>
       <span>{message}</span>
     </div>
