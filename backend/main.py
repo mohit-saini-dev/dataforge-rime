@@ -1,14 +1,16 @@
+from __future__ import annotations
+
 from dotenv import load_dotenv
 
 load_dotenv()
 
 import asyncio
-from dataclasses import dataclass
 import logging
 import os
 import re
 import time
-from typing import Dict, List, Optional, Set
+from dataclasses import dataclass
+from typing import Optional, Set
 
 from livekit import rtc
 from livekit.agents import (
@@ -29,12 +31,14 @@ from backend.config import (
     LIVEKIT_URL,
     RIME_API_KEY,
 )
-from backend.control.turn_controller import TurnController
-from backend.tools.executor import ToolExecutionHarness
+from backend.control.turn_controller import (
+    Turn,
+    TurnController,
+)
 from backend.tts.rime_plugin import (
     FencedRimeTTS,
-    PCMFramer,
     RimeTTSHTTPError,
+    RimeTTSNetworkError,
     TurnInterrupted,
 )
 
@@ -50,203 +54,206 @@ logger = logging.getLogger("backend.main")
 
 SAMPLE_RATE = 24000
 NUM_CHANNELS = 1
-# Strict LiveKit direct capture (queue_size_ms=0) requires exact 10ms frames (240 samples / 480 bytes)
+
 FRAME_DURATION_MS = 10
-SAMPLES_PER_FRAME = int(SAMPLE_RATE * (FRAME_DURATION_MS / 1000.0))  # 240 samples
-BYTES_PER_SAMPLE = 2  # 16-bit PCM
-FRAME_SIZE_BYTES = SAMPLES_PER_FRAME * NUM_CHANNELS * BYTES_PER_SAMPLE  # 480 bytes
+FRAME_DURATION_SEC = FRAME_DURATION_MS / 1000.0
 
-BARGE_IN_DEBOUNCE_SEC = 0.080
+SAMPLES_PER_FRAME = 240
+FRAME_SIZE_BYTES = 480
 
-CONTROL_STOP_PATTERNS = [
-    r"^wait\s+a\s+(minute|second|sec)",
-    r"^hold\s+on(\s+a\s+second)?",
-    r"^(wait|stop|hold\s+on|hang\s+on|listen|pause|shut\s+up)(\s+(wait|stop|please|now))*",
-    r"^no(\s+no)*$",
-]
+SOFTWARE_QUEUE_FRAMES = 8
+NATIVE_QUEUE_MS = 50
 
+BARGE_IN_DEBOUNCE_SEC = 0.120
 
-def classify_utterance(raw_text: str) -> tuple[str, str]:
-    text = raw_text.strip().lower()
-    cleaned = text
-
-    for pat in CONTROL_STOP_PATTERNS:
-        match = re.search(pat, cleaned)
-        if match:
-            cleaned = cleaned[match.end():].lstrip(" ,.?!")
-            break
-
-    if not cleaned or len(cleaned) <= 1:
-        return ("control_only", "")
-
-    if cleaned != text and len(cleaned) > 2:
-        return ("redirect", cleaned)
-
-    return ("query", raw_text)
+CONTROL_PREFIXES = (
+    "wait",
+    "wait a second",
+    "wait a minute",
+    "one second",
+    "one moment",
+    "hold on",
+    "hang on",
+    "pause",
+    "stop",
+    "listen",
+    "shut up",
+)
 
 
-@dataclass
+@dataclass(slots=True)
 class TurnIntent:
-    kind: str  # "vad_start" | "stt_final"
+    kind: str
     payload: str = ""
 
 
-@dataclass
-class AudioSegment:
-    segment_id: int
-    epoch: int
-    text: str
-    is_bridge: bool = False
-    total_frames: int = 0
-    captured_frames: int = 0
-    published: bool = False
+def classify_utterance(raw_text: str) -> tuple[str, str]:
+    text = " ".join(raw_text.strip().split())
+    if not text:
+        return "control_only", ""
+
+    lowered = text.casefold()
+    if re.fullmatch(r"(?:no\s*)+", lowered):
+        return "control_only", ""
+
+    for prefix in sorted(CONTROL_PREFIXES, key=len, reverse=True):
+        pattern = rf"^{re.escape(prefix)}(?:[\s,;:!?]+|$)"
+        match = re.match(pattern, lowered)
+        if match:
+            remainder = text[match.end() :].lstrip(" ,;:!?-")
+            if not remainder:
+                return "control_only", ""
+            return "redirect", remainder
+
+    return "query", text
 
 
 class AuthoritativeAudioPump:
     """
-    Jitter-buffered publication pump (150ms runway) with synchronous purge.
-    Authoritatively tracks hardware capture to guarantee accuracy of the spoken ledger.
+    Real-time 10ms frame scheduler with drift compensation and queue clearance.
     """
 
-    def __init__(self, source: rtc.AudioSource, sample_rate: int = SAMPLE_RATE):
+    def __init__(self, source: rtc.AudioSource, controller: TurnController) -> None:
         self.source = source
-        self.sample_rate = sample_rate
-        # 15 frames = 150ms playout runway; purges synchronously without latency penalties
-        self.queue: asyncio.Queue[tuple[int, int, bytes]] = asyncio.Queue(maxsize=15)
-        self.active_epoch = 1
-        self.pump_task: asyncio.Task | None = None
+        self.controller = controller
+        self.queue: asyncio.Queue[tuple[int, int, bytes]] = asyncio.Queue(
+            maxsize=SOFTWARE_QUEUE_FRAMES
+        )
+        self.active_epoch = 0
         self.running = False
         self.stopped = False
-
-        self.segments: Dict[int, AudioSegment] = {}
-        self._segment_counter = 0
+        self.pump_task: Optional[asyncio.Task] = None
 
     def start(self) -> asyncio.Task:
+        if self.running:
+            raise RuntimeError("audio pump already running")
         self.running = True
         self.stopped = False
-        self.pump_task = asyncio.create_task(self._drain_loop(), name="audio_pump_drain")
+        self.pump_task = asyncio.create_task(self._drain_loop(), name="audio_pump")
         return self.pump_task
 
-    def register_segment(self, epoch: int, text: str, is_bridge: bool = False) -> int:
-        self._segment_counter += 1
-        seg_id = self._segment_counter
-        self.segments[seg_id] = AudioSegment(
-            segment_id=seg_id,
-            epoch=epoch,
-            text=text,
-            is_bridge=is_bridge,
-        )
-        return seg_id
+    def sync_epoch(self, epoch: int) -> None:
+        self.active_epoch = epoch
+
+    async def push_frame(self, epoch: int, clause_id: int, frame_bytes: bytes) -> bool:
+        if len(frame_bytes) != FRAME_SIZE_BYTES:
+            raise ValueError(f"audio frame must be {FRAME_SIZE_BYTES} bytes")
+
+        if self.stopped or not self.running or epoch != self.active_epoch:
+            return False
+
+        ledger = self.controller.get_publication_ledger(epoch)
+        if ledger is None:
+            return False
+
+        try:
+            await self.queue.put((epoch, clause_id, frame_bytes))
+            ledger.record_generated_frame(clause_id, SAMPLES_PER_FRAME)
+        except asyncio.CancelledError:
+            raise
+
+        return epoch == self.active_epoch and not self.stopped
+
+    async def _drain_loop(self) -> None:
+        next_deadline: Optional[float] = None
+
+        while self.running:
+            try:
+                epoch, clause_id, data = await self.queue.get()
+            except asyncio.CancelledError:
+                break
+
+            try:
+                if epoch != self.active_epoch or self.stopped:
+                    continue
+
+                now = time.monotonic()
+                if next_deadline is None or (now - next_deadline) > (FRAME_DURATION_SEC * 3):
+                    next_deadline = now
+                else:
+                    delay = next_deadline - now
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+
+                if epoch != self.active_epoch or self.stopped:
+                    continue
+
+                frame = rtc.AudioFrame(
+                    data=bytearray(data),
+                    sample_rate=SAMPLE_RATE,
+                    num_channels=NUM_CHANNELS,
+                    samples_per_channel=SAMPLES_PER_FRAME,
+                )
+
+                await self.source.capture_frame(frame)
+
+                if epoch != self.active_epoch or self.stopped:
+                    if hasattr(self.source, "clear_queue"):
+                        self.source.clear_queue()
+                    continue
+
+                ledger = self.controller.get_publication_ledger(epoch)
+                if ledger is not None:
+                    ledger.record_captured_frame(clause_id, SAMPLES_PER_FRAME)
+
+                next_deadline = (next_deadline or time.monotonic()) + FRAME_DURATION_SEC
+                drift = time.monotonic() - next_deadline
+                if drift > (FRAME_DURATION_SEC * 2):
+                    next_deadline = time.monotonic()
+
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("AudioSource.capture_frame failed")
+                if hasattr(self.source, "clear_queue"):
+                    try:
+                        self.source.clear_queue()
+                    except Exception:
+                        pass
+            finally:
+                self.queue.task_done()
 
     def cut_audio_immediate(self) -> None:
-        """Atomic invalidation, queue clearance, and native WebRTC hardware purge."""
         self.active_epoch = -1
-
-        while not self.queue.empty():
+        while True:
             try:
                 self.queue.get_nowait()
                 self.queue.task_done()
-            except (asyncio.QueueEmpty, ValueError):
+            except asyncio.QueueEmpty:
                 break
 
         if hasattr(self.source, "clear_queue"):
             try:
                 self.source.clear_queue()
-            except Exception as e:
-                logger.debug(f"[AudioPump] clear_queue: {e}")
-
-    def sync_epoch(self, epoch: int) -> None:
-        self.active_epoch = epoch
-
-    def get_authoritative_published_text(self, epoch: int) -> str:
-        """
-        Returns only the text of non-bridge clauses that physically crossed
-        the native capture_frame() boundary before the cutoff.
-        """
-        published: List[str] = []
-        for seg in self.segments.values():
-            if seg.epoch == epoch and not seg.is_bridge and seg.captured_frames > 0:
-                ratio = seg.captured_frames / max(1, seg.total_frames)
-                if ratio >= 0.4:
-                    published.append(seg.text)
-        return " ".join(published).strip()
-
-    async def push_frame(
-        self,
-        epoch: int,
-        seg_id: int,
-        frame: bytes,
-        turn_active: asyncio.Event | None = None,
-    ) -> bool:
-        if self.stopped or not self.running or epoch != self.active_epoch:
-            return False
-
-        if turn_active is not None and not turn_active.is_set():
-            return False
-
-        if seg_id in self.segments:
-            self.segments[seg_id].total_frames += 1
-
-        try:
-            await asyncio.wait_for(self.queue.put((epoch, seg_id, frame)), timeout=0.12)
-            return True
-        except (asyncio.TimeoutError, asyncio.CancelledError):
-            return False
-
-    async def _drain_loop(self) -> None:
-        while self.running:
-            try:
-                epoch, seg_id, frame_bytes = await self.queue.get()
-            except asyncio.CancelledError:
-                break
-
-            # Pre-capture fence
-            if epoch != self.active_epoch:
-                self.queue.task_done()
-                continue
-
-            frame = rtc.AudioFrame(
-                data=bytearray(frame_bytes),
-                sample_rate=self.sample_rate,
-                num_channels=NUM_CHANNELS,
-                samples_per_channel=SAMPLES_PER_FRAME,
-            )
-
-            try:
-                await self.source.capture_frame(frame)
-
-                # Post-capture fence: if generation was invalidated mid-FFI, clear hardware buffer
-                if epoch != self.active_epoch:
-                    if hasattr(self.source, "clear_queue"):
-                        self.source.clear_queue()
-                else:
-                    if seg_id in self.segments:
-                        self.segments[seg_id].captured_frames += 1
-
-            except Exception as e:
-                logger.error(f"[AudioPump] capture_frame error: {e}")
-            finally:
-                self.queue.task_done()
-
-    async def wait_until_drained(self, timeout: float = 3.0) -> bool:
-        try:
-            await asyncio.wait_for(self.queue.join(), timeout=timeout)
-        except asyncio.TimeoutError:
-            return False
-
-        if hasattr(self.source, "wait_for_playout"):
-            try:
-                await asyncio.wait_for(self.source.wait_for_playout(), timeout=0.5)
             except Exception:
                 pass
-        else:
-            await asyncio.sleep(0.02)
-        return True
+
+    async def wait_until_drained(self, epoch: int, timeout: float = 4.0) -> bool:
+        if epoch != self.active_epoch:
+            return False
+        try:
+            await asyncio.wait_for(self.queue.join(), timeout=timeout)
+            if epoch != self.active_epoch:
+                return False
+
+            if hasattr(self.source, "wait_for_playout"):
+                await asyncio.wait_for(self.source.wait_for_playout(), timeout=1.0)
+            else:
+                await asyncio.sleep(0.04)
+
+            return epoch == self.active_epoch
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            return False
+        except Exception:
+            return False
 
     async def stop(self) -> None:
+        if self.stopped:
+            return
         self.stopped = True
         self.running = False
         self.cut_audio_immediate()
+
         if self.pump_task and not self.pump_task.done():
             self.pump_task.cancel()
             try:
@@ -255,127 +262,120 @@ class AuthoritativeAudioPump:
                 pass
 
 
-class UtteranceStabilizer:
-    """
-    Stabilizes rapid Deepgram final transcripts.
-    Debounces multiple revisions within 200ms into a single authoritative turn intent.
-    """
-
-    def __init__(self, submit_callback):
-        self.submit_callback = submit_callback
-        self.buffer: str = ""
-        self.timer: asyncio.Task | None = None
-        self.lock = asyncio.Lock()
-
-    async def on_final(self, transcript: str):
-        async with self.lock:
-            self.buffer = transcript
-            if self.timer and not self.timer.done():
-                self.timer.cancel()
-            self.timer = asyncio.create_task(self._emit_delayed())
-
-    async def _emit_delayed(self):
-        try:
-            await asyncio.sleep(0.20)  # 200ms stabilization window
-            async with self.lock:
-                if self.buffer:
-                    self.submit_callback(TurnIntent(kind="stt_final", payload=self.buffer))
-                    self.buffer = ""
-        except asyncio.CancelledError:
-            pass
-
-    async def cancel(self):
-        async with self.lock:
-            if self.timer and not self.timer.done():
-                self.timer.cancel()
-            self.buffer = ""
-
-
 class SessionManager:
-    def __init__(self, ctx: JobContext, room: rtc.Room, participant: rtc.RemoteParticipant | None):
+    def __init__(self, ctx: JobContext, room: rtc.Room) -> None:
         self.ctx = ctx
         self.room = room
-        self.participant = participant
-        self.turn_controller = TurnController()
-        self.tool_harness = ToolExecutionHarness()
-        self.tts = FencedRimeTTS(api_key=RIME_API_KEY)
+        self.user_identity: Optional[str] = None
+
+        self.controller = TurnController(max_history_turns=50)
+
+        self.tts = FencedRimeTTS(
+            speaker="amber",
+            model="mist",
+            sample_rate=SAMPLE_RATE,
+            api_key=RIME_API_KEY,
+            speed_alpha=0.95,
+        )
+
+        chosen_model = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+        logger.info(f"[Session] Groq LLM initialized with model: {chosen_model}")
 
         self.llm_client = groq.LLM(
             api_key=GROQ_API_KEY,
-            model="openai/gpt-oss-20b",
+            model=chosen_model,
         )
 
         try:
-            self.audio_source = rtc.AudioSource(SAMPLE_RATE, NUM_CHANNELS, queue_size_ms=0)
-            logger.info("[Session] LiveKit AudioSource initialized with queue_size_ms=0 (direct capture)")
+            self.audio_source = rtc.AudioSource(
+                SAMPLE_RATE,
+                NUM_CHANNELS,
+                queue_size_ms=NATIVE_QUEUE_MS,
+            )
+            logger.info(f"[Session] AudioSource initialized with queue_size_ms={NATIVE_QUEUE_MS}")
         except TypeError:
             self.audio_source = rtc.AudioSource(SAMPLE_RATE, NUM_CHANNELS)
 
-        self.audio_pump = AuthoritativeAudioPump(self.audio_source, SAMPLE_RATE)
-        self.audio_track: rtc.LocalAudioTrack | None = None
-        self.audio_publication: rtc.LocalTrackPublication | None = None
-
-        self.current_state = "disconnected"
-        self.session_tasks: Set[asyncio.Task] = set()
+        self.audio_pump = AuthoritativeAudioPump(self.audio_source, self.controller)
+        self.audio_track: Optional[rtc.LocalAudioTrack] = None
 
         self.intent_queue: asyncio.Queue[TurnIntent] = asyncio.Queue()
-        self.arbiter_task: asyncio.Task | None = None
-        self.stabilizer = UtteranceStabilizer(self.enqueue_intent_nowait)
+        self.arbiter_task: Optional[asyncio.Task] = None
+        self.session_tasks: Set[asyncio.Task] = set()
 
-        self.current_turn_task: asyncio.Task | None = None
-        self.current_turn_event: asyncio.Event | None = None
-        self.current_turn_id: int = 0
-        self.current_epoch: int = 0
+        self.current_turn_task: Optional[asyncio.Task] = None
+        self.current_turn_event: Optional[asyncio.Event] = None
+        self.current_state = "disconnected"
 
-        self.last_barge_in_time = 0.0
+        self.active_speech_epoch = 0
+        self._last_barge_in = 0.0
+        self._state_sequence = 0
         self.is_closing = False
         self.shutdown_event = asyncio.Event()
 
-    def supervise_task(self, coro, name: str | None = None) -> asyncio.Task | None:
+    def accepts_participant(self, participant: rtc.RemoteParticipant) -> bool:
+        if self.user_identity is None or self.user_identity == participant.identity:
+            self.user_identity = participant.identity
+            return True
+        return False
+
+    def supervise(self, coro, name: str) -> Optional[asyncio.Task]:
         if self.is_closing:
             return None
-
         task = asyncio.create_task(coro, name=name)
         self.session_tasks.add(task)
 
-        def _cleanup(t: asyncio.Task):
-            self.session_tasks.discard(t)
-            if not t.cancelled() and t.exception():
-                logger.error(f"[Session] Task {t.get_name()} failed: {t.exception()}")
+        def done_callback(done: asyncio.Task) -> None:
+            self.session_tasks.discard(done)
+            if done.cancelled():
+                return
+            try:
+                exc = done.exception()
+            except asyncio.CancelledError:
+                return
+            if exc:
+                logger.error(f"Task {done.get_name()} failed: {exc}", exc_info=exc)
 
-        task.add_done_callback(_cleanup)
+        task.add_done_callback(done_callback)
         return task
 
-    async def set_agent_state_if_current(self, epoch: int, state: str) -> None:
-        if not self.turn_controller.validate_audio_epoch(epoch):
+    async def set_state(self, state: str, turn_id: Optional[int] = None) -> None:
+        if turn_id is not None and not self.controller.validate_turn(turn_id):
             return
+
+        self._state_sequence += 1
+        sequence = self._state_sequence
         self.current_state = state
+
         try:
-            await self.room.local_participant.set_attributes({"lk.agent.state": state})
+            if sequence == self._state_sequence:
+                await self.room.local_participant.set_attributes({"lk.agent.state": state})
         except Exception:
-            pass
+            return
 
     async def start(self) -> None:
         self.audio_track = rtc.LocalAudioTrack.create_audio_track("agent-mic", self.audio_source)
-        pub_opts = rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
-        self.audio_publication = await self.room.local_participant.publish_track(self.audio_track, pub_opts)
+        options = rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
+        await self.room.local_participant.publish_track(self.audio_track, options)
 
+        self.audio_pump.start()
         self.current_state = "listening"
-        await self.room.local_participant.set_attributes({"lk.agent.state": "listening"})
+        await self.set_state("listening")
+        self.arbiter_task = self.supervise(self._arbiter_worker(), "turn_arbiter")
 
-        pump_task = self.audio_pump.start()
-        self.session_tasks.add(pump_task)
-        pump_task.add_done_callback(self.session_tasks.discard)
-
-        self.arbiter_task = self.supervise_task(self._turn_arbiter_worker(), name="turn_arbiter")
-
-    def enqueue_intent_nowait(self, intent: TurnIntent) -> None:
-        """Synchronous O(1) intent submission without task creation latency."""
+    async def submit_intent(self, intent: TurnIntent) -> None:
         if not self.is_closing:
-            self.intent_queue.put_nowait(intent)
+            await self.intent_queue.put(intent)
 
-    async def _turn_arbiter_worker(self):
-        """Single consumer managing state transitions across VAD and STT."""
+    async def _ensure_speech_episode(self) -> int:
+        if self.active_speech_epoch:
+            return self.active_speech_epoch
+        episode = await self.controller.begin_speech_episode()
+        self.active_speech_epoch = episode.speech_epoch
+        logger.info(f"[STT Episode] Opened episode {self.active_speech_epoch}")
+        return self.active_speech_epoch
+
+    async def _arbiter_worker(self) -> None:
         while not self.is_closing:
             try:
                 intent = await self.intent_queue.get()
@@ -383,220 +383,386 @@ class SessionManager:
                 break
 
             try:
-                if intent.kind == "vad_start":
-                    await self._arbiter_handle_vad_cut()
-
+                if intent.kind == "barge_in":
+                    await self._handle_barge_in()
+                elif intent.kind == "stt_interim":
+                    epoch = await self._ensure_speech_episode()
+                    await self.controller.set_interim_transcript(epoch, intent.payload)
                 elif intent.kind == "stt_final":
-                    await self._arbiter_handle_stt_final(intent.payload)
-
-            except Exception as e:
-                logger.error(f"[Arbiter] Error on {intent.kind}: {e}", exc_info=True)
+                    epoch = await self._ensure_speech_episode()
+                    await self.controller.append_transcript_final(epoch, intent.payload)
+                elif intent.kind == "speech_end":
+                    await self._handle_speech_end()
+            except Exception:
+                logger.exception(f"Turn arbiter error on {intent.kind}")
             finally:
                 self.intent_queue.task_done()
 
-    async def _arbiter_handle_vad_cut(self):
+    async def _handle_barge_in(self) -> None:
         if self.current_state not in ("speaking", "thinking"):
             return
 
         now = time.monotonic()
-        if now - self.last_barge_in_time < BARGE_IN_DEBOUNCE_SEC:
+        if now - self._last_barge_in < BARGE_IN_DEBOUNCE_SEC:
             return
-        self.last_barge_in_time = now
+        self._last_barge_in = now
+        await self._interrupt_current_turn("vad_speech")
 
-        # 1. IMMEDIATE HARDWARE STOP
-        self.audio_pump.cut_audio_immediate()
+    async def _cancel_turn_task(self, task: Optional[asyncio.Task]) -> None:
+        if not task or task.done():
+            return
+        task.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=0.100)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+        except Exception:
+            pass
 
-        # 2. ADVANCE HARDWARE EPOCH INSTANTLY (Prevents any race with in-flight tasks)
-        new_epoch = await self.turn_controller.cut_audio(reason="vad_speech_started")
-        self.current_epoch = new_epoch
-        self.audio_pump.sync_epoch(new_epoch)
+    async def _interrupt_current_turn(self, reason: str) -> None:
+        old_turn_id = self.controller.active_turn_id
+        old_task = self.current_turn_task
+        self.current_turn_task = None
 
-        # 3. Halt producer and consumer tasks
         if self.current_turn_event:
             self.current_turn_event.clear()
 
-        task_to_cancel = self.current_turn_task
-        self.current_turn_task = None
-        if task_to_cancel and not task_to_cancel.done():
-            task_to_cancel.cancel()
+        self.audio_pump.cut_audio_immediate()
 
-        # 4. Commit ledger text that actually crossed WebRTC boundary
-        spoken_text = self.audio_pump.get_authoritative_published_text(self.current_epoch - 1)
-        await self.turn_controller.interrupt_active_turn(
-            turn_id=self.current_turn_id,
-            published_text=spoken_text,
-            reason="vad_speech_started",
+        new_epoch, spoken = await self.controller.interrupt_and_advance_audio(
+            old_turn_id,
+            reason=reason,
         )
+        if spoken:
+            logger.info(f"[Interruption] Preserved spoken text: '{spoken[:60]}...'")
 
-        await self.set_agent_state_if_current(new_epoch, "listening")
-        logger.info(f"[Arbiter] VAD Cut: Turn {self.current_turn_id} halted. Preserved: '{spoken_text[:40]}...'")
+        self.audio_pump.sync_epoch(new_epoch)
+        await self._cancel_turn_task(old_task)
+        await self.set_state("listening")
 
-    async def _arbiter_handle_stt_final(self, raw_transcript: str):
-        kind, clean_payload = classify_utterance(raw_transcript)
-        logger.info(f"[Arbiter] STT Final -> Kind: {kind}, Clean: '{clean_payload}'")
+    async def _handle_speech_end(self) -> None:
+        speech_epoch = self.active_speech_epoch
+        if not speech_epoch:
+            return
+
+        transcript = await self.controller.endpoint_speech_episode(speech_epoch)
+        self.active_speech_epoch = 0
+        if not transcript or not transcript.strip():
+            return
+
+        kind, payload = classify_utterance(transcript)
+        logger.info(f"Speech episode {speech_epoch} => {kind}: '{payload}'")
 
         if kind == "control_only":
-            logger.info("[Arbiter] Standalone control utterance consumed. Maintaining listening state.")
-            await self._arbiter_handle_vad_cut()
             return
 
-        is_redirect = (kind == "redirect")
+        await self._start_turn(payload, is_redirect=(kind == "redirect"))
 
-        # Invalidate current generation and audio buffer
+    async def _start_turn(self, prompt: str, is_redirect: bool) -> None:
+        self.audio_pump.cut_audio_immediate()
         if self.current_turn_event:
             self.current_turn_event.clear()
 
-        task_to_cancel = self.current_turn_task
+        old_task = self.current_turn_task
         self.current_turn_task = None
-        if task_to_cancel and not task_to_cancel.done():
-            task_to_cancel.cancel()
+        await self._cancel_turn_task(old_task)
 
-        self.audio_pump.cut_audio_immediate()
-
-        if is_redirect:
-            spoken_text = self.audio_pump.get_authoritative_published_text(self.current_epoch)
-            await self.turn_controller.interrupt_active_turn(
-                turn_id=self.current_turn_id,
-                published_text=spoken_text,
-                reason="user_redirected",
-            )
-
-        # Canonical TurnController start_turn call
-        turn_id, epoch = await self.turn_controller.start_turn(clean_payload, is_redirect=is_redirect)
-        self.current_turn_id = turn_id
-        self.current_epoch = epoch
-        self.audio_pump.sync_epoch(epoch)
+        turn = await self.controller.start_turn(prompt, is_redirect=is_redirect)
+        self.audio_pump.sync_epoch(turn.audio_epoch)
 
         turn_event = asyncio.Event()
         turn_event.set()
         self.current_turn_event = turn_event
 
-        self.current_turn_task = self.supervise_task(
-            self.execute_turn_stream(clean_payload, turn_id, epoch, turn_event, is_redirect=is_redirect),
-            name=f"turn_{turn_id}",
+        self.current_turn_task = self.supervise(
+            self.execute_turn_stream(turn, turn_event),
+            f"turn_{turn.turn_id}",
         )
 
-    async def execute_turn_stream(
-        self,
-        prompt: str,
-        turn_id: int,
-        epoch: int,
-        turn_active: asyncio.Event,
-        is_redirect: bool = False,
-    ):
-        await self.set_agent_state_if_current(epoch, "thinking")
+    @staticmethod
+    def _extract_text(chunk) -> str:
+        delta = getattr(chunk, "delta", None)
+        if delta is not None:
+            content = getattr(delta, "content", None)
+            if content:
+                return str(content)
 
-        sentence_queue: asyncio.Queue[tuple[str, bool] | None] = asyncio.Queue()
-        full_reply: List[str] = []
-        turn_framer = PCMFramer(FRAME_SIZE_BYTES)
+        choices = getattr(chunk, "choices", None)
+        if choices:
+            choice_delta = getattr(choices[0], "delta", None)
+            content = getattr(choice_delta, "content", None) if choice_delta else None
+            if content:
+                return str(content)
+        return ""
 
-        # Bridge UX chrome marked is_bridge=True so it never enters dialogue history
-        if is_redirect:
-            await sentence_queue.put(("Got it, focusing on that instead:", True))
+    @staticmethod
+    def _split_llm_buffer(buffer: str) -> tuple[list[str], str]:
+        clauses: list[str] = []
+        while True:
+            match = re.search(r"[.!?](?:\s+|$)|\n+", buffer)
+            if match:
+                end = match.end()
+                clause = buffer[:end].strip()
+                buffer = buffer[end:].lstrip()
+                if clause:
+                    clauses.append(clause)
+                continue
+
+            if len(buffer) >= 380:
+                cut = max(
+                    buffer.rfind(", ", 0, 420),
+                    buffer.rfind("; ", 0, 420),
+                    buffer.rfind(" - ", 0, 420),
+                    buffer.rfind(" ", 0, 420),
+                )
+                if cut <= 0:
+                    cut = min(420, len(buffer))
+                else:
+                    if buffer[cut] in ",;":
+                        cut += 1
+                clauses.append(buffer[:cut].strip())
+                buffer = buffer[cut:].lstrip()
+                continue
+            break
+        return clauses, buffer
+
+    async def execute_turn_stream(self, turn: Turn, turn_active: asyncio.Event) -> None:
+        turn_id = turn.turn_id
+        epoch = turn.audio_epoch
+        ledger = turn.publication_ledger
+
+        if ledger is None:
+            raise RuntimeError("turn has no publication ledger")
+
+        await self.set_state("thinking", turn_id)
+
+        sentence_queue: asyncio.Queue[Optional[tuple[int, str]]] = asyncio.Queue(maxsize=4)
+        full_reply: list[str] = []
+        clause_counter = 0
 
         chat_ctx = llm.ChatContext()
         chat_ctx.add_message(
             role="system",
             content=(
-                "You are an interactive, real-time voice assistant for travel. "
-                "Always respond in natural, direct, spoken English. "
-                "Never use Markdown formatting, bolding, bullet points, asterisks, "
-                "tables, or vertical bars (|). Speak in concise, fluid sentences. "
-                "CRITICAL INSTRUCTION: If your previous turn was interrupted, answer the new request directly. "
-                "Never repeat or restart explanations from the beginning."
+                "You are an articulate, patient, and knowledgeable academic and technical mentor. "
+                "Speak in a calm, deliberate, conversational cadence with natural phrasing. "
+                "Explain concepts systematically and clearly rather than rushing through shallow summaries. "
+                "Never use Markdown, bullets, tables, asterisks, numbered lists, or vertical bars. "
+                "If the user interrupted you and changed direction, acknowledge the pivot briefly and answer "
+                "the new question directly without restarting previous explanations."
             ),
         )
 
-        for msg in self.turn_controller.build_chat_context_messages(max_recent_turns=10):
-            chat_ctx.add_message(role=msg["role"], content=msg["content"])
+        for message in self.controller.build_chat_context_messages(max_recent_turns=10):
+            chat_ctx.add_message(role=message["role"], content=message["content"])
 
-        async def llm_producer():
+        if turn.is_redirect:
+            await sentence_queue.put((-1, "Understood, focusing on that instead."))
+
+        async def put_sentinel() -> None:
+            while True:
+                try:
+                    await asyncio.wait_for(sentence_queue.put(None), timeout=0.1)
+                    break
+                except asyncio.TimeoutError:
+                    if not turn_active.is_set() or not self.controller.validate_turn(turn_id):
+                        break
+
+        async def produce() -> None:
+            buffer = ""
             try:
                 stream = self.llm_client.chat(chat_ctx=chat_ctx)
-                buffer = ""
                 async for chunk in stream:
-                    if not turn_active.is_set() or not self.turn_controller.validate_audio_epoch(epoch):
+                    if not turn_active.is_set() or not self.controller.validate_turn(turn_id):
                         return
 
-                    content = ""
-                    if hasattr(chunk, "delta") and chunk.delta and hasattr(chunk.delta, "content"):
-                        content = chunk.delta.content or ""
-                    elif hasattr(chunk, "choices") and chunk.choices:
-                        content = chunk.choices[0].delta.content or ""
-
+                    content = self._extract_text(chunk)
                     if not content:
                         continue
 
                     full_reply.append(content)
                     buffer += content
+                    clauses, buffer = self._split_llm_buffer(buffer)
 
-                    if any(p in buffer for p in [". ", "? ", "! ", "\n"]):
-                        clause = buffer.strip()
-                        buffer = ""
-                        if clause and any(c.isalnum() for c in clause):
-                            await sentence_queue.put((clause, False))
+                    for clause in clauses:
+                        if clause and any(ch.isalnum() for ch in clause):
+                            if not turn_active.is_set() or not self.controller.validate_turn(turn_id):
+                                return
+                            await sentence_queue.put((0, clause))
 
-                remainder = buffer.strip()
-                if remainder and any(c.isalnum() for c in remainder) and turn_active.is_set():
-                    await sentence_queue.put((remainder, False))
+                if buffer.strip() and turn_active.is_set() and self.controller.validate_turn(turn_id):
+                    await sentence_queue.put((0, buffer.strip()))
             finally:
-                await sentence_queue.put(None)
+                await put_sentinel()
 
-        async def tts_consumer():
-            has_started = False
+        async def consume() -> None:
+            nonlocal clause_counter
             try:
                 while True:
-                    if not turn_active.is_set() or not self.turn_controller.validate_audio_epoch(epoch):
+                    if not turn_active.is_set() or not self.controller.validate_turn(turn_id):
                         return
 
                     item = await sentence_queue.get()
-                    if item is None:
-                        break
-
-                    clause, is_bridge = item
-
-                    if not has_started:
-                        await self.set_agent_state_if_current(epoch, "speaking")
-                        has_started = True
-
-                    seg_id = self.audio_pump.register_segment(epoch, clause, is_bridge=is_bridge)
-
-                    async for frame in self.tts.stream_speech(
-                        clause,
-                        turn_id=epoch,
-                        framer=turn_framer,
-                        fence_validator=lambda ep: turn_active.is_set() and self.turn_controller.validate_audio_epoch(ep),
-                    ):
-                        if not turn_active.is_set() or not self.turn_controller.validate_audio_epoch(epoch):
+                    try:
+                        if item is None:
                             return
-                        await self.audio_pump.push_frame(epoch, seg_id, frame, turn_active=turn_active)
 
-                if turn_active.is_set() and self.turn_controller.validate_audio_epoch(epoch):
-                    for final_frame in turn_framer.flush():
-                        await self.audio_pump.push_frame(epoch, 0, final_frame, turn_active=turn_active)
+                        _, clause = item
+                        clause_counter += 1
+                        clause_id = clause_counter
 
-            except TurnInterrupted:
-                logger.info(f"[Session] Turn {turn_id} aborted mid-synthesis")
-                return
+                        ledger.register_clause(clause_id, clause)
+                        await self.set_state("speaking", turn_id)
+
+                        self._last_barge_in = time.monotonic()
+
+                        async for frame in self.tts.stream_speech(
+                            clause,
+                            turn_id=epoch,
+                            fence_validator=(
+                                lambda e: turn_active.is_set()
+                                and self.controller.validate_audio_epoch(e)
+                                and self.controller.validate_turn(turn_id)
+                            ),
+                        ):
+                            if not turn_active.is_set() or not self.controller.validate_audio_epoch(epoch):
+                                raise TurnInterrupted()
+
+                            accepted = await self.audio_pump.push_frame(epoch, clause_id, frame)
+                            if not accepted:
+                                raise TurnInterrupted()
+
+                        ledger.mark_clause_complete(clause_id)
+                    finally:
+                        sentence_queue.task_done()
+            except asyncio.CancelledError:
+                raise
+
+        producer_task = asyncio.create_task(produce(), name=f"llm_{turn_id}")
+        consumer_task = asyncio.create_task(consume(), name=f"tts_{turn_id}")
 
         try:
-            await asyncio.gather(llm_producer(), tts_consumer())
+            await asyncio.gather(producer_task, consumer_task)
 
-            # Playout barrier: wait for audio to physically drain before committing completed response
-            if turn_active.is_set() and self.turn_controller.validate_audio_epoch(epoch):
-                drained = await self.audio_pump.wait_until_drained(timeout=3.0)
-                if drained and turn_active.is_set() and self.turn_controller.validate_audio_epoch(epoch):
-                    await self.turn_controller.complete_turn(turn_id, epoch, "".join(full_reply))
-                await self.set_agent_state_if_current(epoch, "listening")
+            if not turn_active.is_set() or not self.controller.validate_turn(turn_id):
+                return
 
+            if not await self.audio_pump.wait_until_drained(epoch):
+                raise RuntimeError("Audio playout drain timeout")
+
+            if not await self.controller.complete_turn(turn_id, "".join(full_reply)):
+                return
+
+            await self.set_state("listening")
+
+        except (asyncio.CancelledError, TurnInterrupted):
+            producer_task.cancel()
+            consumer_task.cancel()
+            await asyncio.gather(producer_task, consumer_task, return_exceptions=True)
+
+        except (RimeTTSHTTPError, RimeTTSNetworkError):
+            logger.exception(f"Rime TTS failed on turn {turn_id}")
+            self.audio_pump.cut_audio_immediate()
+            await self.controller.fail_turn(turn_id, "tts_error")
+            await self.set_state("listening")
+
+        except Exception:
+            logger.exception(f"Turn {turn_id} execution failed")
+            self.audio_pump.cut_audio_immediate()
+            await self.controller.fail_turn(turn_id, "turn_error")
+            await self.set_state("listening")
+
+    async def handle_stt_track(self, track: rtc.Track) -> None:
+        try:
+            stt_instance = deepgram.STT(
+                api_key=DEEPGRAM_API_KEY,
+                model="nova-2-general",
+                language="en-US",
+                interim_results=True,
+                punctuate=True,
+                smart_format=True,
+                endpointing_ms=900,
+            )
+            logger.info("[STT] Deepgram initialized with endpointing_ms=900")
+        except TypeError:
+            try:
+                stt_instance = deepgram.STT(
+                    api_key=DEEPGRAM_API_KEY,
+                    model="nova-2-general",
+                    language="en-US",
+                    interim_results=True,
+                )
+                logger.info("[STT] Deepgram initialized with interim_results")
+            except TypeError:
+                stt_instance = deepgram.STT(api_key=DEEPGRAM_API_KEY)
+
+        stream = stt_instance.stream()
+        audio_stream = rtc.AudioStream(track)
+
+        async def push_audio() -> None:
+            try:
+                async for frame_event in audio_stream:
+                    frame = getattr(frame_event, "frame", frame_event)
+                    stream.push_frame(frame)
+            finally:
+                try:
+                    stream.end_input()
+                except Exception:
+                    pass
+
+        async def read_events() -> None:
+            async for event in stream:
+                event_type = getattr(event, "type", None)
+
+                if event_type == stt.SpeechEventType.INTERIM_TRANSCRIPT:
+                    text = event.alternatives[0].text if event.alternatives else ""
+                    if text:
+                        await self.submit_intent(TurnIntent("stt_interim", text))
+
+                elif event_type == stt.SpeechEventType.FINAL_TRANSCRIPT:
+                    text = event.alternatives[0].text if event.alternatives else ""
+                    if text:
+                        logger.info(f"[STT Final] '{text}'")
+                        await self.submit_intent(TurnIntent("stt_final", text))
+
+                elif (
+                    event_type == stt.SpeechEventType.END_OF_SPEECH
+                    or (hasattr(stt.SpeechEventType, "END_OF_SPEECH") and event_type == stt.SpeechEventType.END_OF_SPEECH)
+                ):
+                    await self.submit_intent(TurnIntent("speech_end"))
+
+        push_task = asyncio.create_task(push_audio(), name="stt_audio_push")
+        read_task = asyncio.create_task(read_events(), name="stt_event_reader")
+
+        try:
+            done, pending = await asyncio.wait(
+                (push_task, read_task),
+                return_when=asyncio.FIRST_EXCEPTION,
+            )
+            for task in done:
+                exc = task.exception()
+                if exc:
+                    raise exc
+            await asyncio.gather(*pending)
         except asyncio.CancelledError:
             raise
-        except RimeTTSHTTPError as e:
-            logger.error(f"[Session] Rime API failed during turn {turn_id}: {e}")
-            await self.set_agent_state_if_current(epoch, "listening")
-        except Exception as e:
-            logger.error(f"[Session] Turn {turn_id} error: {e}", exc_info=True)
-            await self.set_agent_state_if_current(epoch, "listening")
+        finally:
+            for task in (push_task, read_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(push_task, read_task, return_exceptions=True)
+
+            try:
+                await audio_stream.aclose()
+            except Exception:
+                pass
+            try:
+                await stream.aclose()
+            except Exception:
+                pass
+
+    async def wait_until_closed(self) -> None:
+        await self.shutdown_event.wait()
 
     async def shutdown(self) -> None:
         if self.is_closing:
@@ -604,122 +770,93 @@ class SessionManager:
         self.is_closing = True
         self.shutdown_event.set()
 
-        logger.info("[Session] Initiating ordered shutdown...")
-
-        # Invalidate audio publication boundary first
         self.audio_pump.cut_audio_immediate()
-
-        if self.arbiter_task and not self.arbiter_task.done():
-            self.arbiter_task.cancel()
-
-        await self.stabilizer.cancel()
-
         if self.current_turn_event:
             self.current_turn_event.clear()
 
-        if self.current_turn_task and not self.current_turn_task.done():
-            self.current_turn_task.cancel()
+        cur_task = self.current_turn_task
+        self.current_turn_task = None
+        await self._cancel_turn_task(cur_task)
 
-        pending = [t for t in list(self.session_tasks) if not t.done()]
-        for t in pending:
-            t.cancel()
-
-        if pending:
+        if self.arbiter_task and not self.arbiter_task.done():
+            self.arbiter_task.cancel()
             try:
-                await asyncio.wait_for(
-                    asyncio.gather(*pending, return_exceptions=True),
-                    timeout=1.0,
-                )
-            except asyncio.TimeoutError:
+                await self.arbiter_task
+            except asyncio.CancelledError:
                 pass
+
+        for task in list(self.session_tasks):
+            if not task.done():
+                task.cancel()
+
+        if self.session_tasks:
+            await asyncio.gather(*list(self.session_tasks), return_exceptions=True)
 
         await self.audio_pump.stop()
         await self.tts.aclose()
-
-    async def wait_until_closed(self) -> None:
-        await self.shutdown_event.wait()
 
 
 async def entrypoint(ctx: JobContext) -> None:
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
     room = ctx.room
 
-    try:
-        participant = await asyncio.wait_for(ctx.wait_for_participant(), timeout=2.0)
-    except asyncio.TimeoutError:
-        participant = next(iter(ctx.room.remote_participants.values()), None)
+    session = SessionManager(ctx, room)
 
-    session = SessionManager(ctx, room, participant)
+    @room.on("participant_speech_started")
+    def on_participant_speech_started(p: rtc.RemoteParticipant):
+        if session.accepts_participant(p):
+            asyncio.create_task(session.submit_intent(TurnIntent("barge_in")))
+
+    subscribed_tracks: Set[str] = set()
+
+    async def attach_track(track: rtc.Track, participant: rtc.RemoteParticipant) -> None:
+        if not session.accepts_participant(participant):
+            return
+        if track.kind != rtc.TrackKind.KIND_AUDIO:
+            return
+        if track.sid in subscribed_tracks:
+            return
+
+        subscribed_tracks.add(track.sid)
+        logger.info(f"[Audio Ingest] Track {track.sid} attached for {participant.identity}")
+        task = session.supervise(session.handle_stt_track(track), f"stt_{track.sid}")
+        if task is None:
+            subscribed_tracks.discard(track.sid)
+
+    @room.on("track_subscribed")
+    def on_track_subscribed(
+        track: rtc.Track,
+        publication: rtc.TrackPublication,
+        participant: rtc.RemoteParticipant,
+    ):
+        asyncio.create_task(attach_track(track, participant))
+
+    @room.on("track_unsubscribed")
+    def on_track_unsubscribed(
+        track: rtc.Track,
+        publication: rtc.TrackPublication,
+        participant: rtc.RemoteParticipant,
+    ):
+        subscribed_tracks.discard(track.sid)
+
+    @room.on("disconnected")
+    def on_room_disconnected(*args):
+        asyncio.create_task(session.shutdown())
 
     try:
         await session.start()
 
-        # Synchronous, non-blocking O(1) submission upon energy detection
-        @room.on("participant_speech_started")
-        def on_participant_speech_started(p: rtc.RemoteParticipant):
-            if session.participant and p.identity != session.participant.identity:
-                return
-            session.enqueue_intent_nowait(TurnIntent(kind="vad_start"))
-
-        subscribed_tracks: Set[str] = set()
-
-        @room.on("track_subscribed")
-        def on_track_subscribed(
-            track: rtc.Track,
-            publication: rtc.TrackPublication,
-            participant: rtc.RemoteParticipant,
-        ):
-            if track.kind == rtc.TrackKind.KIND_AUDIO:
-                if track.sid in subscribed_tracks:
-                    return
-                subscribed_tracks.add(track.sid)
-                logger.info(f"[Room] Subscribed to participant audio track: {track.sid}")
-
-                async def stt_forwarder():
-                    stt_instance = deepgram.STT(api_key=DEEPGRAM_API_KEY)
-                    stt_stream = stt_instance.stream()
-                    audio_stream = rtc.AudioStream(track)
-
-                    async def push_audio():
-                        try:
-                            async for event in audio_stream:
-                                stt_stream.push_frame(event.frame)
-                        finally:
-                            stt_stream.end_input()
-
-                    async def read_transcripts():
-                        async for event in stt_stream:
-                            if event.type == stt.SpeechEventType.FINAL_TRANSCRIPT:
-                                raw_text = event.alternatives[0].text.strip() if event.alternatives else ""
-                                if raw_text:
-                                    await session.stabilizer.on_final(raw_text)
-
-                    try:
-                        await asyncio.gather(push_audio(), read_transcripts())
-                    except asyncio.CancelledError:
-                        pass
-                    finally:
-                        subscribed_tracks.discard(track.sid)
-                        await stt_stream.aclose()
-
-                session.supervise_task(stt_forwarder(), name=f"stt_{track.sid}")
-
-        @room.on("disconnected")
-        def on_disconnected():
-            asyncio.create_task(session.shutdown())
+        for remote_participant in room.remote_participants.values():
+            for publication in remote_participant.track_publications.values():
+                if publication.track is not None:
+                    await attach_track(publication.track, remote_participant)
 
         await session.wait_until_closed()
+    except asyncio.CancelledError:
+        raise
     finally:
         await session.shutdown()
 
 
 if __name__ == "__main__":
-    cli.run_app(
-        WorkerOptions(
-            entrypoint_fnc=entrypoint,
-            agent_name="dataforge-agent",
-            ws_url=LIVEKIT_URL,
-            api_key=LIVEKIT_API_KEY,
-            api_secret=LIVEKIT_API_SECRET,
-        )
-    )
+    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))

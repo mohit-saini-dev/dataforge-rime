@@ -1,7 +1,4 @@
-"""
-Rime TTS integration plugin with 10ms frame alignment (for LiveKit direct capture),
-connection pooling, strict Content-Type validation, and generation fencing.
-"""
+from __future__ import annotations
 
 import asyncio
 import logging
@@ -17,80 +14,67 @@ except ImportError:
     rtc = None
     HAS_LIVEKIT = False
 
-logger = logging.getLogger("dataforge_rime.tts")
+logger = logging.getLogger("backend.tts.rime")
 
-# Synchronous, non-blocking scalar predicate: O(1), zero-await
 SyncFenceValidator = Callable[[int], bool]
 
 
 class TurnInterrupted(Exception):
-    """Raised when active synthesis is aborted due to barge-in."""
-    pass
-
-
-class RimeTTSProtocolError(RuntimeError):
-    """Raised when upstream audio data violates s16le PCM invariants."""
     pass
 
 
 class RimeTTSHTTPError(RuntimeError):
-    """Raised when Rime returns a non-200 HTTP response."""
-    def __init__(self, status: int, body: str = ""):
-        super().__init__(f"Rime TTS HTTP {status}: {body[:300]}")
+    def __init__(self, status: int, body: str = "") -> None:
         self.status = status
         self.body = body
+        super().__init__(f"Rime HTTP {status}: {body[:500]}")
+
+
+class RimeTTSProtocolError(RuntimeError):
+    pass
+
+
+class RimeTTSNetworkError(RuntimeError):
+    pass
 
 
 class PCMFramer:
-    """
-    Accumulates arbitrary network chunks and yields exact frame-sized slices.
-    Assembles raw stream bytes into complete 10ms 16-bit PCM frames (480 bytes at 24kHz).
-    """
+    """Converts arbitrary s16le byte chunks into exact 10ms (480 bytes) PCM frames."""
 
-    def __init__(self, frame_size: int, bytes_per_sample: int = 2):
-        if frame_size <= 0 or frame_size % bytes_per_sample != 0:
-            raise ValueError(f"Invalid frame_size {frame_size}; must be divisible by {bytes_per_sample}")
-
-        self.frame_size = frame_size
-        self.bytes_per_sample = bytes_per_sample
-        self.buffer = bytearray()
+    def __init__(self, frame_bytes: int = 480) -> None:
+        if frame_bytes <= 0 or frame_bytes % 2 != 0:
+            raise ValueError("frame_bytes must be a positive even integer")
+        self.frame_bytes = frame_bytes
+        self._buffer = bytearray()
 
     def push(self, data: bytes) -> list[bytes]:
         if not data:
             return []
-
-        # Accumulate arbitrary network bytes directly into the frame buffer
-        self.buffer.extend(data)
+        self._buffer.extend(data)
         frames: list[bytes] = []
-        while len(self.buffer) >= self.frame_size:
-            frames.append(bytes(self.buffer[: self.frame_size]))
-            del self.buffer[: self.frame_size]
+        while len(self._buffer) >= self.frame_bytes:
+            frames.append(bytes(self._buffer[: self.frame_bytes]))
+            del self._buffer[: self.frame_bytes]
         return frames
 
     def flush(self) -> list[bytes]:
-        if not self.buffer:
+        """Emits zero-padded final frame for normal completion."""
+        if not self._buffer:
             return []
 
-        # Truncate any odd trailing byte at turn boundary
-        if len(self.buffer) % self.bytes_per_sample != 0:
-            del self.buffer[-1:]
+        if len(self._buffer) % 2 != 0:
+            self._buffer.clear()
+            raise RimeTTSProtocolError("Odd trailing PCM byte count returned by Rime")
 
-        if not self.buffer:
-            return []
-
-        padding = self.frame_size - len(self.buffer)
-        final_frame = bytes(self.buffer) + (b"\x00" * padding)
-        self.buffer.clear()
-        return [final_frame]
+        frame = bytes(self._buffer).ljust(self.frame_bytes, b"\x00")
+        self._buffer.clear()
+        return [frame]
 
 
 class FencedRimeTTS:
-    """
-    Rime TTS client with keep-alive connection pooling, strict s16le verification,
-    and instantaneous HTTP teardown upon turn invalidation.
-    """
-
-    RIME_TTS_URL = "https://users.rime.ai/v1/rime-tts"
+    URL = "https://users.rime.ai/v1/rime-tts"
+    MAX_TEXT_CHARS = 500
+    FRAME_DURATION_SEC = 0.010
 
     def __init__(
         self,
@@ -98,38 +82,56 @@ class FencedRimeTTS:
         model: str = "mist",
         sample_rate: int = 24000,
         api_key: Optional[str] = None,
+        speed_alpha: float = 0.95,
     ) -> None:
         self.speaker = speaker
         self.model = model
         self.sample_rate = sample_rate
         self.api_key = api_key
-        # Direct capture requires 10ms frames at 24kHz: 24,000 * 1 * 2 * 0.01 = 480 bytes (240 samples)
-        self.frame_bytes = int(self.sample_rate * 2 * 0.01)
-        self.samples_per_channel = self.frame_bytes // 2
+        self.speed_alpha = speed_alpha
+
+        self.samples_per_channel = int(sample_rate * self.FRAME_DURATION_SEC)
+        self.frame_bytes = self.samples_per_channel * 2
+
         self._session: Optional[aiohttp.ClientSession] = None
         self._session_lock = asyncio.Lock()
+        self._closed = False
 
-    async def get_session(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
-            async with self._session_lock:
-                if self._session is None or self._session.closed:
-                    conn = aiohttp.TCPConnector(
-                        limit=10,
-                        limit_per_host=4,
-                        ttl_dns_cache=300,
-                        keepalive_timeout=60.0,
-                        enable_cleanup_closed=True,
-                    )
-                    self._session = aiohttp.ClientSession(connector=conn)
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._closed:
+            raise RuntimeError("Rime TTS client is closed")
+        if self._session is not None and not self._session.closed:
+            return self._session
+
+        async with self._session_lock:
+            if self._session is None or self._session.closed:
+                timeout = aiohttp.ClientTimeout(
+                    total=None,
+                    connect=3.0,
+                    sock_connect=3.0,
+                    sock_read=15.0,  # Tolerant read timeout
+                )
+                connector = aiohttp.TCPConnector(
+                    limit=8,
+                    limit_per_host=4,
+                    ttl_dns_cache=300,
+                    keepalive_timeout=60.0,
+                )
+                self._session = aiohttp.ClientSession(
+                    timeout=timeout,
+                    connector=connector,
+                )
         return self._session
 
-    async def aclose(self) -> None:
-        if self._session and not self._session.closed:
-            await self._session.close()
+    @staticmethod
+    def clean_text(text: str) -> str:
+        text = re.sub(r"[`*_#|~<>]", " ", text)
+        text = re.sub(r"\s+", " ", text)
+        return text.strip()
 
     def create_audio_frame(self, data: bytes) -> Any:
         if len(data) != self.frame_bytes:
-            raise ValueError(f"AudioFrame invariant violated: got {len(data)} bytes, expected {self.frame_bytes}")
+            raise RimeTTSProtocolError(f"PCM frame length {len(data)} != {self.frame_bytes}")
         if HAS_LIVEKIT and rtc is not None:
             return rtc.AudioFrame(
                 data=bytearray(data),
@@ -143,81 +145,82 @@ class FencedRimeTTS:
         self,
         text: str,
         turn_id: int,
-        framer: PCMFramer,
         fence_validator: Optional[SyncFenceValidator] = None,
+        framer: Optional[PCMFramer] = None,
         as_audio_frame: bool = False,
     ) -> AsyncGenerator[Union[bytes, Any], None]:
-        clean_text = text.strip()
+        clean_text = self.clean_text(text)[: self.MAX_TEXT_CHARS]
         if not clean_text:
             return
 
-        if len(clean_text) > 500:
-            clean_text = clean_text[:500]
-
-        # Strip markdown and vertical bars while preserving flight hyphens (FL-101)
-        clean_text = re.sub(r"[|\*#_`~>]", " ", clean_text)
-        clean_text = re.sub(r"(?<=\s)-|-(?=\s)", " ", clean_text)
-        clean_text = re.sub(r"\s+", " ", clean_text).strip()
-
-        if not clean_text:
-            return
+        if not self.api_key:
+            raise RuntimeError("RIME_API_KEY is not configured")
 
         if fence_validator is not None and not fence_validator(turn_id):
-            raise TurnInterrupted(f"Turn {turn_id} pre-check invalid")
+            raise TurnInterrupted()
 
-        headers = {
-            "Accept": "audio/L16",
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
+        local_framer = framer if framer is not None else PCMFramer(self.frame_bytes)
 
         payload = {
             "text": clean_text,
-            "speaker": self.speaker,
             "modelId": self.model,
+            "speaker": self.speaker,
             "samplingRate": self.sample_rate,
+            "speedAlpha": self.speed_alpha,
             "audioFormat": "pcm",
-            "speedAlpha": 1.0,
-            "reduceLatency": True,
+        }
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "Accept": "audio/L16",
         }
 
-        session = await self.get_session()
-        timeout = aiohttp.ClientTimeout(total=None, connect=3.0, sock_connect=3.0, sock_read=4.0)
+        session = await self._get_session()
+        response: Optional[aiohttp.ClientResponse] = None
 
-        resp = None
-        frame_yield_count = 0
         try:
-            resp = await session.post(self.RIME_TTS_URL, headers=headers, json=payload, timeout=timeout)
-            if resp.status != 200:
-                err_body = await resp.text()
-                resp.close()
-                raise RimeTTSHTTPError(resp.status, err_body)
+            response = await session.post(self.URL, json=payload, headers=headers)
+            async with response:
+                if response.status != 200:
+                    body = await response.text()
+                    raise RimeTTSHTTPError(response.status, body)
 
-            content_type = resp.headers.get("Content-Type", "").split(";", 1)[0].lower().strip()
-            if content_type not in {"audio/l16", "audio/pcm", "application/octet-stream"}:
-                logger.warning(f"Unexpected Rime content type '{content_type}' on turn {turn_id}")
+                content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+                if content_type not in {"audio/l16", "audio/pcm", "application/octet-stream"}:
+                    raise RimeTTSProtocolError(f"Unexpected Rime content type: {content_type!r}")
 
-            async for chunk in resp.content.iter_any():
-                if fence_validator is not None and not fence_validator(turn_id):
-                    resp.close()
-                    raise TurnInterrupted(f"Turn {turn_id} invalidated during network stream")
-
-                for frame in framer.push(chunk):
+                async for chunk in response.content.iter_any():
                     if fence_validator is not None and not fence_validator(turn_id):
-                        resp.close()
-                        raise TurnInterrupted(f"Turn {turn_id} invalidated mid-frame push")
+                        response.close()
+                        raise TurnInterrupted()
 
-                    yield self.create_audio_frame(frame) if as_audio_frame else frame
-                    frame_yield_count += 1
+                    for frame in local_framer.push(chunk):
+                        if fence_validator is not None and not fence_validator(turn_id):
+                            response.close()
+                            raise TurnInterrupted()
+                        yield self.create_audio_frame(frame) if as_audio_frame else frame
 
-                    # Yield event loop periodically so VAD/interruption tasks run concurrently
-                    if frame_yield_count % 8 == 0:
-                        await asyncio.sleep(0)
+                if framer is None:
+                    for frame in local_framer.flush():
+                        if fence_validator is not None and not fence_validator(turn_id):
+                            raise TurnInterrupted()
+                        yield self.create_audio_frame(frame) if as_audio_frame else frame
 
         except asyncio.CancelledError:
-            if resp and not resp.closed:
-                resp.close()
+            if response is not None and not response.closed:
+                response.close()
             raise
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            if response is not None and not response.closed:
+                response.close()
+            raise RimeTTSNetworkError(f"Rime network failure on epoch {turn_id}: {exc}") from exc
         finally:
-            if resp and not resp.closed:
-                resp.close()
+            if response is not None and not response.closed:
+                response.close()
+
+    async def aclose(self) -> None:
+        self._closed = True
+        async with self._session_lock:
+            if self._session is not None and not self._session.closed:
+                await self._session.close()
+            self._session = None

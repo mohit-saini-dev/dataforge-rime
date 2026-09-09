@@ -1,223 +1,338 @@
-"""
-TurnController: Strict 3-clock conversational manager (speech_epoch, audio_epoch, turn_id).
-Enforces authoritative spoken-ledger semantics, structured ChatML context generation,
-bounded recency windows, and O(1) publication fencing.
-"""
-
 from __future__ import annotations
+
 import asyncio
-from dataclasses import dataclass, field
-from enum import Enum
 import logging
 import time
-from typing import Any, Dict, List, Optional
+from collections import OrderedDict
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Dict, List, Optional
 
 logger = logging.getLogger("backend.turn_controller")
 
 
-class TurnStatus(Enum):
-    IDLE = 0
-    ACTIVE = 1
-    INTERRUPTED = 2
-    COMPLETED = 3
+class TurnStatus(str, Enum):
+    ACTIVE = "active"
+    INTERRUPTED = "interrupted"
+    COMPLETED = "completed"
+    FAILED = "failed"
 
 
-@dataclass
-class AssistantSegment:
-    segment_id: int
+@dataclass(slots=True)
+class SpeechEpisode:
+    speech_epoch: int
+    started_at: float = field(default_factory=time.monotonic)
+    transcript_segments: List[str] = field(default_factory=list)
+    latest_interim: str = ""
+    endpointed: bool = False
+    committed: bool = False
+
+    def append_final(self, text: str) -> None:
+        cleaned = " ".join(text.split())
+        if not cleaned:
+            return
+        if self.transcript_segments and self.transcript_segments[-1].lower() == cleaned.lower():
+            return
+        self.transcript_segments.append(cleaned)
+
+    @property
+    def transcript(self) -> str:
+        return " ".join(part for part in self.transcript_segments if part).strip()
+
+
+@dataclass(slots=True)
+class PublicationEntry:
+    clause_id: int
     text: str
-    published: bool = False
-    timestamp_ns: int = field(default_factory=time.perf_counter_ns)
+    total_frames: int = 0
+    captured_frames: int = 0
+    total_samples: int = 0
+    captured_samples: int = 0
+    complete: bool = False
+    invalidated: bool = False
+
+    @property
+    def fully_published(self) -> bool:
+        return (
+            self.complete
+            and not self.invalidated
+            and self.captured_frames >= self.total_frames
+            and self.total_frames > 0
+        )
+
+    def was_substantially_published(self, min_ratio: float = 0.75) -> bool:
+        if self.fully_published:
+            return True
+        if self.total_frames > 0:
+            return (self.captured_frames / self.total_frames) >= min_ratio
+        return False
 
 
-@dataclass
-class ConversationalTurn:
+@dataclass(slots=True)
+class PublicationLedger:
+    generation_id: int
+    entries: OrderedDict[int, PublicationEntry] = field(default_factory=OrderedDict)
+    invalidated: bool = False
+
+    def register_clause(self, clause_id: int, text: str) -> None:
+        self.entries[clause_id] = PublicationEntry(clause_id=clause_id, text=text)
+
+    def record_generated_frame(self, clause_id: int, samples: int) -> None:
+        if clause_id in self.entries:
+            entry = self.entries[clause_id]
+            entry.total_frames += 1
+            entry.total_samples += samples
+
+    def record_captured_frame(self, clause_id: int, samples: int) -> None:
+        if clause_id in self.entries:
+            entry = self.entries[clause_id]
+            entry.captured_frames += 1
+            entry.captured_samples += samples
+
+    def mark_clause_complete(self, clause_id: int) -> None:
+        if clause_id in self.entries:
+            self.entries[clause_id].complete = True
+
+    def invalidate(self) -> None:
+        self.invalidated = True
+        for entry in self.entries.values():
+            if not entry.fully_published:
+                entry.invalidated = True
+
+    def published_text(self, min_ratio: float = 0.75) -> str:
+        parts = []
+        for entry in self.entries.values():
+            if entry.was_substantially_published(min_ratio=min_ratio):
+                parts.append(entry.text)
+        return " ".join(parts).strip()
+
+
+@dataclass(slots=True)
+class AudioGeneration:
+    audio_epoch: int
+    turn_id: int
+    ledger: PublicationLedger
+    started_at: float = field(default_factory=time.monotonic)
+    invalidated: bool = False
+
+
+@dataclass(slots=True)
+class Turn:
     turn_id: int
     user_prompt: str
-    is_redirect: bool = False
+    is_redirect: bool
     status: TurnStatus = TurnStatus.ACTIVE
-    assistant_segments: List[AssistantSegment] = field(default_factory=list)
+    audio_epoch: int = 0
+    assistant_generated_text: str = ""
+    publication_ledger: Optional[PublicationLedger] = None
     interrupted_reason: str = ""
-    created_at_ns: int = field(default_factory=time.perf_counter_ns)
+    created_at: float = field(default_factory=time.monotonic)
+    completed_at: float = 0.0
 
 
 class TurnController:
-    """
-    Authoritative state machine decoupling:
-    1. Speech Epoch: Deduplicates VAD vocal episodes.
-    2. Audio Epoch: Instantaneous, atomic WebRTC hardware publication fence.
-    3. Turn ID: Conversational dialogue lifecycle and LLM context history.
-    """
-
-    def __init__(self, max_history_turns: int = 50):
+    def __init__(self, max_history_turns: int = 50) -> None:
         self._lock = asyncio.Lock()
+        self._speech_counter = 0
+        self._turn_counter = 0
+        self._audio_counter = 0
 
-        # Clock 1: User Speech Episode (VAD)
-        self._speech_epoch: int = 0
+        self._active_speech_epoch = 0
+        self._active_turn_id = 0
+        self._active_audio_epoch = 0
 
-        # Clock 2: Audio Publication Boundary (Hardware cutoff fence)
-        self._audio_epoch: int = 0
-
-        # Clock 3: Conversational Turn Identifier
-        self._current_turn_id: int = 0
-        self._active_turn_id: int = 0
-
-        self.turns: Dict[int, ConversationalTurn] = {}
-        self.max_history_turns: int = max_history_turns
-
-    @property
-    def audio_epoch(self) -> int:
-        return self._audio_epoch
+        self._speech_episodes: OrderedDict[int, SpeechEpisode] = OrderedDict()
+        self._turns: OrderedDict[int, Turn] = OrderedDict()
+        self._audio_generations: Dict[int, AudioGeneration] = {}
+        self.max_history_turns = max(4, max_history_turns)
 
     @property
     def speech_epoch(self) -> int:
-        return self._speech_epoch
+        return self._active_speech_epoch
 
     @property
     def active_turn_id(self) -> int:
         return self._active_turn_id
 
+    @property
+    def audio_epoch(self) -> int:
+        return self._active_audio_epoch
+
+    @property
+    def turns(self) -> OrderedDict[int, Turn]:
+        return self._turns
+
+    def get_turn(self, turn_id: int) -> Optional[Turn]:
+        return self._turns.get(turn_id)
+
+    def validate_speech_epoch(self, epoch: int) -> bool:
+        return epoch != 0 and epoch == self._active_speech_epoch
+
     def validate_audio_epoch(self, epoch: int) -> bool:
-        """O(1) scalar check for AudioPump hardware publication."""
-        return epoch == self._audio_epoch
+        return epoch != 0 and epoch == self._active_audio_epoch
 
     def validate_turn(self, turn_id: int) -> bool:
-        """O(1) scalar check to verify if a turn is still active."""
-        turn = self.turns.get(turn_id)
-        return (
-            turn is not None
-            and turn.turn_id == self._active_turn_id
-            and turn.status == TurnStatus.ACTIVE
-        )
+        turn = self._turns.get(turn_id)
+        return bool(turn and turn_id == self._active_turn_id and turn.status == TurnStatus.ACTIVE)
 
-    async def begin_speech_episode(self) -> tuple[int, int]:
-        """
-        Invoked on VAD start.
-        Advances speech_epoch and audio_epoch simultaneously.
-        Returns: (speech_epoch, audio_epoch)
-        """
+    async def begin_speech_episode(self) -> SpeechEpisode:
         async with self._lock:
-            self._speech_epoch += 1
-            self._audio_epoch += 1
-            return self._speech_epoch, self._audio_epoch
+            self._speech_counter += 1
+            self._active_speech_epoch = self._speech_counter
+            episode = SpeechEpisode(speech_epoch=self._active_speech_epoch)
+            self._speech_episodes[episode.speech_epoch] = episode
 
-    async def cut_audio(self, reason: str = "barge_in") -> int:
-        """Immediate hardware fence invalidation without mutating dialogue."""
+            while len(self._speech_episodes) > self.max_history_turns * 2:
+                self._speech_episodes.popitem(last=False)
+            return episode
+
+    async def append_transcript_final(self, speech_epoch: int, text: str) -> bool:
         async with self._lock:
-            self._audio_epoch += 1
-            logger.info(f"[TurnController] Audio cut -> Epoch {self._audio_epoch} (Reason: {reason})")
-            return self._audio_epoch
+            episode = self._speech_episodes.get(speech_epoch)
+            if not episode or episode.committed:
+                return False
+            episode.append_final(text)
+            return True
 
-    async def start_turn(self, user_prompt: str, is_redirect: bool = False) -> tuple[int, int]:
-        """
-        Opens a new conversational turn upon receiving a validated substantive STT final.
-        Returns: (turn_id, audio_epoch)
-        """
+    async def set_interim_transcript(self, speech_epoch: int, text: str) -> bool:
         async with self._lock:
-            if self._active_turn_id in self.turns:
-                prior = self.turns[self._active_turn_id]
-                if prior.status == TurnStatus.ACTIVE:
-                    prior.status = TurnStatus.INTERRUPTED
-                    prior.interrupted_reason = "superseded_by_new_turn"
+            episode = self._speech_episodes.get(speech_epoch)
+            if not episode or episode.committed:
+                return False
+            episode.latest_interim = " ".join(text.split())
+            return True
 
-            self._current_turn_id += 1
-            self._active_turn_id = self._current_turn_id
-            self._audio_epoch += 1
+    async def endpoint_speech_episode(self, speech_epoch: int) -> Optional[str]:
+        async with self._lock:
+            episode = self._speech_episodes.get(speech_epoch)
+            if not episode or episode.committed:
+                return None
+            episode.endpointed = True
+            transcript = episode.transcript or episode.latest_interim
+            episode.committed = True
+            return transcript.strip()
 
-            turn = ConversationalTurn(
-                turn_id=self._active_turn_id,
+    async def start_turn(self, user_prompt: str, is_redirect: bool = False) -> Turn:
+        async with self._lock:
+            prior = self._turns.get(self._active_turn_id)
+            if prior and prior.status == TurnStatus.ACTIVE:
+                prior.status = TurnStatus.INTERRUPTED
+                prior.interrupted_reason = "superseded_by_new_turn"
+                if prior.publication_ledger:
+                    prior.publication_ledger.invalidate()
+                    prior.assistant_generated_text = prior.publication_ledger.published_text(min_ratio=0.75)
+
+            self._turn_counter += 1
+            turn = Turn(
+                turn_id=self._turn_counter,
                 user_prompt=user_prompt.strip(),
                 is_redirect=is_redirect,
-                status=TurnStatus.ACTIVE,
             )
-            self.turns[self._active_turn_id] = turn
-            self._prune_turns_locked()
+            self._turns[turn.turn_id] = turn
+            self._active_turn_id = turn.turn_id
 
+            self._audio_counter += 1
+            self._active_audio_epoch = self._audio_counter
+
+            ledger = PublicationLedger(generation_id=self._active_audio_epoch)
+            turn.audio_epoch = self._active_audio_epoch
+            turn.publication_ledger = ledger
+
+            self._audio_generations[self._active_audio_epoch] = AudioGeneration(
+                audio_epoch=self._active_audio_epoch,
+                turn_id=turn.turn_id,
+                ledger=ledger,
+            )
+
+            self._prune_locked()
             logger.info(
-                f"[TurnController] Started Turn {turn.turn_id} (Epoch {self._audio_epoch}, redirect={is_redirect})"
+                f"[TurnController] Started Turn {turn.turn_id} (Epoch {self._active_audio_epoch}, redirect={is_redirect})"
             )
-            return turn.turn_id, self._audio_epoch
+            return turn
 
-    async def interrupt_active_turn(self, turn_id: int, published_text: str, reason: str = "vad_speech") -> int:
+    async def interrupt_and_advance_audio(self, turn_id: int, reason: str = "vad_speech") -> tuple[int, str]:
         """
-        Idempotent turn cutoff.
-        Records ONLY the text that AudioPump confirmed crossed the WebRTC boundary.
+        Atomic operation: freezes ledger, computes spoken text, marks interrupted,
+        and advances audio generation epoch without orphaning metrics.
         """
         async with self._lock:
-            self._audio_epoch += 1
+            spoken_text = ""
+            turn = self._turns.get(turn_id)
+            if turn and turn.status == TurnStatus.ACTIVE:
+                turn.status = TurnStatus.INTERRUPTED
+                turn.interrupted_reason = reason
+                if turn.publication_ledger:
+                    turn.publication_ledger.invalidate()
+                    spoken_text = turn.publication_ledger.published_text(min_ratio=0.75)
+                    turn.assistant_generated_text = spoken_text
 
-            turn = self.turns.get(turn_id)
-            if not turn or turn.status != TurnStatus.ACTIVE:
-                return self._audio_epoch
+            if self._active_audio_epoch:
+                old = self._audio_generations.get(self._active_audio_epoch)
+                if old:
+                    old.invalidated = True
+                    old.ledger.invalidate()
 
-            turn.status = TurnStatus.INTERRUPTED
-            turn.interrupted_reason = reason
+            self._audio_counter += 1
+            self._active_audio_epoch = self._audio_counter
+            return self._active_audio_epoch, spoken_text
 
-            clean_text = published_text.strip()
-            if clean_text:
-                turn.assistant_segments.append(
-                    AssistantSegment(segment_id=0, text=clean_text, published=True)
-                )
-                logger.info(f"[TurnController] Turn {turn_id} interrupted. Published text preserved: '{clean_text[:50]}...'")
-
-            return self._audio_epoch
-
-    async def complete_turn(self, turn_id: int, epoch: int, full_response: str) -> bool:
-        """Commits full response only if the turn and audio epoch remained clean throughout playout."""
+    async def complete_turn(self, turn_id: int, full_response: str) -> bool:
         async with self._lock:
-            if epoch != self._audio_epoch:
-                logger.info(f"[TurnController] Stale audio completion for Epoch {epoch}")
-                return False
-
-            turn = self.turns.get(turn_id)
-            if not turn or turn.status != TurnStatus.ACTIVE:
-                logger.info(f"[TurnController] Cannot complete non-active Turn {turn_id}")
+            turn = self._turns.get(turn_id)
+            if not turn or turn_id != self._active_turn_id or turn.status != TurnStatus.ACTIVE:
                 return False
 
             turn.status = TurnStatus.COMPLETED
-            turn.assistant_segments.clear()
-            turn.assistant_segments.append(
-                AssistantSegment(segment_id=0, text=full_response.strip(), published=True)
-            )
-            logger.info(f"[TurnController] Turn {turn_id} successfully completed.")
+            turn.assistant_generated_text = full_response.strip()
+            turn.completed_at = time.monotonic()
+            logger.info(f"[TurnController] Turn {turn_id} marked COMPLETED.")
             return True
 
+    async def fail_turn(self, turn_id: int, reason: str) -> bool:
+        async with self._lock:
+            turn = self._turns.get(turn_id)
+            if not turn or turn.status != TurnStatus.ACTIVE:
+                return False
+
+            turn.status = TurnStatus.FAILED
+            turn.interrupted_reason = reason
+            if turn.publication_ledger:
+                turn.publication_ledger.invalidate()
+            return True
+
+    def get_publication_ledger(self, audio_epoch: int) -> Optional[PublicationLedger]:
+        gen = self._audio_generations.get(audio_epoch)
+        return gen.ledger if gen else None
+
     def build_chat_context_messages(self, max_recent_turns: int = 10) -> List[Dict[str, str]]:
-        """
-        Renders the internal turn state machine into structured ChatML messages.
-        Bounded to the most recent turns to fit within LLM context windows.
-        """
-        messages: List[Dict[str, str]] = []
+        result: List[Dict[str, str]] = []
+        turn_items = list(self._turns.values())[-max_recent_turns:]
 
-        sorted_turn_ids = sorted(self.turns.keys())
-        if len(sorted_turn_ids) > max_recent_turns:
-            sorted_turn_ids = sorted_turn_ids[-max_recent_turns:]
-
-        for turn_id in sorted_turn_ids:
-            turn = self.turns[turn_id]
-            if not turn.user_prompt:
+        for turn in turn_items:
+            if not turn.user_prompt or turn.status == TurnStatus.FAILED:
                 continue
 
-            messages.append({"role": "user", "content": turn.user_prompt})
+            result.append({"role": "user", "content": turn.user_prompt})
 
-            if turn.status == TurnStatus.COMPLETED and turn.assistant_segments:
-                messages.append({"role": "assistant", "content": turn.assistant_segments[0].text})
-            elif turn.status == TurnStatus.INTERRUPTED and turn.assistant_segments:
-                spoken = turn.assistant_segments[0].text
-                messages.append({"role": "assistant", "content": spoken})
-                messages.append({
-                    "role": "system",
-                    "content": (
-                        "[Assistant was interrupted by user while speaking above response. "
-                        "Acknowledge the user's redirection concisely and do not repeat previous statements.]"
-                    ),
-                })
+            if turn.status == TurnStatus.COMPLETED and turn.assistant_generated_text:
+                result.append({"role": "assistant", "content": turn.assistant_generated_text})
+            elif turn.status == TurnStatus.INTERRUPTED:
+                spoken = turn.assistant_generated_text
+                if not spoken and turn.publication_ledger:
+                    spoken = turn.publication_ledger.published_text(min_ratio=0.75)
+                if spoken:
+                    result.append({"role": "assistant", "content": f"{spoken} [interrupted by user]"})
 
-        return messages
+        return result
 
-    def _prune_turns_locked(self) -> None:
-        while len(self.turns) > self.max_history_turns:
-            oldest_id = min(self.turns.keys())
-            if oldest_id == self._active_turn_id:
+    def _prune_locked(self) -> None:
+        while len(self._turns) > self.max_history_turns:
+            prune_key = None
+            for tid, t in self._turns.items():
+                if tid != self._active_turn_id and t.status != TurnStatus.ACTIVE:
+                    prune_key = tid
+                    break
+            if prune_key is not None:
+                self._turns.pop(prune_key, None)
+            else:
                 break
-            self.turns.pop(oldest_id, None)
