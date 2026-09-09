@@ -9,7 +9,7 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Set
 
 from livekit import rtc
@@ -52,6 +52,43 @@ if LIVEKIT_API_SECRET:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("backend.main")
 
+
+@dataclass(slots=True)
+class TurnLatencyTracker:
+    turn_id: int
+    t_vad_start: float = 0.0
+    t_speech_end: float = 0.0
+    t_stt_final: float = 0.0
+    t_llm_start: float = 0.0
+    t_llm_first_token: float = 0.0
+    t_tts_start: float = 0.0
+    t_tts_first_frame: float = 0.0
+    t_capture_first_frame: float = 0.0
+
+    def mark(self, field_name: str) -> None:
+        if getattr(self, field_name) == 0.0:
+            setattr(self, field_name, time.perf_counter())
+
+    def _ms(self, start: float, end: float) -> str:
+        if not start or not end or end < start:
+            return "N/A"
+        return f"{(end - start) * 1000.0:.1f}ms"
+
+    def log_summary(self) -> None:
+        logger.info(
+            "\n" + "=" * 54 + "\n"
+            f"⏱️  [Turn Latency Pipeline — Turn #{self.turn_id}]\n"
+            f"  • Speech End (EOS) ➔ STT Final: {self._ms(self.t_speech_end, self.t_stt_final)}\n"
+            f"  • STT Final ➔ LLM First Token:  {self._ms(self.t_stt_final, self.t_llm_first_token)}\n"
+            f"  • LLM Token ➔ TTS First Frame:  {self._ms(self.t_llm_first_token, self.t_tts_first_frame)}\n"
+            f"  • TTS Frame ➔ WebRTC Capture:   {self._ms(self.t_tts_first_frame, self.t_capture_first_frame)}\n"
+            "  " + "-" * 50 + "\n"
+            f"  ⚡ User-Perceived TTFA (EOS):    {self._ms(self.t_speech_end, self.t_capture_first_frame)}\n"
+            f"  🔥 Server Processing TTFA:      {self._ms(self.t_stt_final, self.t_capture_first_frame)}\n"
+            + "=" * 54
+        )
+
+
 SAMPLE_RATE = 24000
 NUM_CHANNELS = 1
 
@@ -85,6 +122,7 @@ CONTROL_PREFIXES = (
 class TurnIntent:
     kind: str
     payload: str = ""
+    timestamp: float = field(default_factory=time.perf_counter)
 
 
 def classify_utterance(raw_text: str) -> tuple[str, str]:
@@ -116,13 +154,14 @@ class AuthoritativeAudioPump:
     def __init__(self, source: rtc.AudioSource, controller: TurnController) -> None:
         self.source = source
         self.controller = controller
-        self.queue: asyncio.Queue[tuple[int, int, bytes]] = asyncio.Queue(
+        self.queue: asyncio.Queue[tuple[int, int, int, bytes]] = asyncio.Queue(
             maxsize=SOFTWARE_QUEUE_FRAMES
         )
         self.active_epoch = 0
         self.running = False
         self.stopped = False
         self.pump_task: Optional[asyncio.Task] = None
+        self.session_manager: Optional[SessionManager] = None
 
     def start(self) -> asyncio.Task:
         if self.running:
@@ -135,7 +174,7 @@ class AuthoritativeAudioPump:
     def sync_epoch(self, epoch: int) -> None:
         self.active_epoch = epoch
 
-    async def push_frame(self, epoch: int, clause_id: int, frame_bytes: bytes) -> bool:
+    async def push_frame(self, epoch: int, turn_id: int, clause_id: int, frame_bytes: bytes) -> bool:
         if len(frame_bytes) != FRAME_SIZE_BYTES:
             raise ValueError(f"audio frame must be {FRAME_SIZE_BYTES} bytes")
 
@@ -147,7 +186,7 @@ class AuthoritativeAudioPump:
             return False
 
         try:
-            await self.queue.put((epoch, clause_id, frame_bytes))
+            await self.queue.put((epoch, turn_id, clause_id, frame_bytes))
             ledger.record_generated_frame(clause_id, SAMPLES_PER_FRAME)
         except asyncio.CancelledError:
             raise
@@ -159,7 +198,7 @@ class AuthoritativeAudioPump:
 
         while self.running:
             try:
-                epoch, clause_id, data = await self.queue.get()
+                epoch, turn_id, clause_id, data = await self.queue.get()
             except asyncio.CancelledError:
                 break
 
@@ -186,6 +225,13 @@ class AuthoritativeAudioPump:
                 )
 
                 await self.source.capture_frame(frame)
+
+                # Attribute capture timestamp to this frame's bound turn_id
+                if self.session_manager and turn_id is not None:
+                    tracker = self.session_manager.get_latency_tracker(turn_id)
+                    if tracker and tracker.t_capture_first_frame == 0.0:
+                        tracker.mark("t_capture_first_frame")
+                        tracker.log_summary()
 
                 if epoch != self.active_epoch or self.stopped:
                     if hasattr(self.source, "clear_queue"):
@@ -269,6 +315,10 @@ class SessionManager:
         self.user_identity: Optional[str] = None
 
         self.controller = TurnController(max_history_turns=50)
+        self.latency_trackers: dict[int, TurnLatencyTracker] = {}
+        self.pending_vad_start: float = 0.0
+        self.pending_speech_end: float = 0.0
+        self.pending_stt_final: float = 0.0
 
         self.tts = FencedRimeTTS(
             speaker="amber",
@@ -297,6 +347,7 @@ class SessionManager:
             self.audio_source = rtc.AudioSource(SAMPLE_RATE, NUM_CHANNELS)
 
         self.audio_pump = AuthoritativeAudioPump(self.audio_source, self.controller)
+        self.audio_pump.session_manager = self
         self.audio_track: Optional[rtc.LocalAudioTrack] = None
 
         self.intent_queue: asyncio.Queue[TurnIntent] = asyncio.Queue()
@@ -312,6 +363,22 @@ class SessionManager:
         self._state_sequence = 0
         self.is_closing = False
         self.shutdown_event = asyncio.Event()
+
+    def create_latency_tracker(self, turn_id: int) -> TurnLatencyTracker:
+        tracker = TurnLatencyTracker(
+            turn_id=turn_id,
+            t_vad_start=self.pending_vad_start,
+            t_speech_end=self.pending_speech_end,
+            t_stt_final=self.pending_stt_final,
+        )
+        self.latency_trackers[turn_id] = tracker
+        if len(self.latency_trackers) > 50:
+            oldest = min(self.latency_trackers)
+            self.latency_trackers.pop(oldest, None)
+        return tracker
+
+    def get_latency_tracker(self, turn_id: int) -> TurnLatencyTracker | None:
+        return self.latency_trackers.get(turn_id)
 
     def accepts_participant(self, participant: rtc.RemoteParticipant) -> bool:
         if self.user_identity is None or self.user_identity == participant.identity:
@@ -384,14 +451,17 @@ class SessionManager:
 
             try:
                 if intent.kind == "barge_in":
+                    self.pending_vad_start = intent.timestamp
                     await self._handle_barge_in()
                 elif intent.kind == "stt_interim":
                     epoch = await self._ensure_speech_episode()
                     await self.controller.set_interim_transcript(epoch, intent.payload)
                 elif intent.kind == "stt_final":
+                    self.pending_stt_final = intent.timestamp
                     epoch = await self._ensure_speech_episode()
                     await self.controller.append_transcript_final(epoch, intent.payload)
                 elif intent.kind == "speech_end":
+                    self.pending_speech_end = intent.timestamp
                     await self._handle_speech_end()
             except Exception:
                 logger.exception(f"Turn arbiter error on {intent.kind}")
@@ -468,6 +538,7 @@ class SessionManager:
         await self._cancel_turn_task(old_task)
 
         turn = await self.controller.start_turn(prompt, is_redirect=is_redirect)
+        self.create_latency_tracker(turn.turn_id)
         self.audio_pump.sync_epoch(turn.audio_epoch)
 
         turn_event = asyncio.Event()
@@ -534,6 +605,10 @@ class SessionManager:
         if ledger is None:
             raise RuntimeError("turn has no publication ledger")
 
+        tracker = self.get_latency_tracker(turn_id)
+        if tracker:
+            tracker.mark("t_llm_start")
+
         await self.set_state("thinking", turn_id)
 
         sentence_queue: asyncio.Queue[Optional[tuple[int, str]]] = asyncio.Queue(maxsize=4)
@@ -580,6 +655,9 @@ class SessionManager:
                     if not content:
                         continue
 
+                    if tracker:
+                        tracker.mark("t_llm_first_token")
+
                     full_reply.append(content)
                     buffer += content
                     clauses, buffer = self._split_llm_buffer(buffer)
@@ -616,6 +694,9 @@ class SessionManager:
 
                         self._last_barge_in = time.monotonic()
 
+                        if tracker:
+                            tracker.mark("t_tts_start")
+
                         async for frame in self.tts.stream_speech(
                             clause,
                             turn_id=epoch,
@@ -625,10 +706,13 @@ class SessionManager:
                                 and self.controller.validate_turn(turn_id)
                             ),
                         ):
+                            if tracker:
+                                tracker.mark("t_tts_first_frame")
+
                             if not turn_active.is_set() or not self.controller.validate_audio_epoch(epoch):
                                 raise TurnInterrupted()
 
-                            accepted = await self.audio_pump.push_frame(epoch, clause_id, frame)
+                            accepted = await self.audio_pump.push_frame(epoch, turn_id, clause_id, frame)
                             if not accepted:
                                 raise TurnInterrupted()
 
@@ -720,16 +804,14 @@ class SessionManager:
                         await self.submit_intent(TurnIntent("stt_interim", text))
 
                 elif event_type == stt.SpeechEventType.FINAL_TRANSCRIPT:
+                    arrival_time = time.perf_counter()
                     text = event.alternatives[0].text if event.alternatives else ""
                     if text:
                         logger.info(f"[STT Final] '{text}'")
-                        await self.submit_intent(TurnIntent("stt_final", text))
+                        await self.submit_intent(TurnIntent("stt_final", text, timestamp=arrival_time))
 
-                elif (
-                    event_type == stt.SpeechEventType.END_OF_SPEECH
-                    or (hasattr(stt.SpeechEventType, "END_OF_SPEECH") and event_type == stt.SpeechEventType.END_OF_SPEECH)
-                ):
-                    await self.submit_intent(TurnIntent("speech_end"))
+                elif event_type == stt.SpeechEventType.END_OF_SPEECH:
+                    await self.submit_intent(TurnIntent("speech_end", timestamp=time.perf_counter()))
 
         push_task = asyncio.create_task(push_audio(), name="stt_audio_push")
         read_task = asyncio.create_task(read_events(), name="stt_event_reader")
@@ -805,7 +887,11 @@ async def entrypoint(ctx: JobContext) -> None:
     @room.on("participant_speech_started")
     def on_participant_speech_started(p: rtc.RemoteParticipant):
         if session.accepts_participant(p):
-            asyncio.create_task(session.submit_intent(TurnIntent("barge_in")))
+            vad_time = time.perf_counter()
+            session.supervise(
+                session.submit_intent(TurnIntent("barge_in", timestamp=vad_time)),
+                f"barge_in_{p.identity}",
+            )
 
     subscribed_tracks: Set[str] = set()
 
@@ -829,7 +915,7 @@ async def entrypoint(ctx: JobContext) -> None:
         publication: rtc.TrackPublication,
         participant: rtc.RemoteParticipant,
     ):
-        asyncio.create_task(attach_track(track, participant))
+        session.supervise(attach_track(track, participant), f"attach_{track.sid}")
 
     @room.on("track_unsubscribed")
     def on_track_unsubscribed(
@@ -841,7 +927,7 @@ async def entrypoint(ctx: JobContext) -> None:
 
     @room.on("disconnected")
     def on_room_disconnected(*args):
-        asyncio.create_task(session.shutdown())
+        session.supervise(session.shutdown(), "room_disconnect_shutdown")
 
     try:
         await session.start()
