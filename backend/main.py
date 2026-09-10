@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -98,23 +99,20 @@ FRAME_DURATION_SEC = FRAME_DURATION_MS / 1000.0
 SAMPLES_PER_FRAME = 240
 FRAME_SIZE_BYTES = 480
 
-SOFTWARE_QUEUE_FRAMES = 8
+# 20 frames = 200ms software queue: eliminates Rime transatlantic jitter
+SOFTWARE_QUEUE_FRAMES = 20
+# 50ms native queue: kept low to ensure instant cut-off without tail lag
 NATIVE_QUEUE_MS = 50
 
 BARGE_IN_DEBOUNCE_SEC = 0.120
 
-CONTROL_PREFIXES = (
-    "wait",
-    "wait a second",
-    "wait a minute",
-    "one second",
-    "one moment",
-    "hold on",
-    "hang on",
-    "pause",
-    "stop",
-    "listen",
-    "shut up",
+_CONTROL_TOKEN = (
+    r"(?:wait(?:\s+a\s+(?:second|minute|sec))?|hold\s+on|hang\s+on|one\s+(?:second|moment)|"
+    r"stop|pause|listen|shut\s+up)"
+)
+_LEADING_CONTROL_RE = re.compile(
+    rf"^(?:\s*{_CONTROL_TOKEN}\s*[\s,;:.!?]*)+",
+    re.IGNORECASE,
 )
 
 
@@ -125,31 +123,28 @@ class TurnIntent:
     timestamp: float = field(default_factory=time.perf_counter)
 
 
-def classify_utterance(raw_text: str) -> tuple[str, str]:
+def detect_control_speech(raw_text: str) -> tuple[str, str]:
+    """Classifies incoming STT text into clean, control, or redirect before buffer merging."""
     text = " ".join(raw_text.strip().split())
     if not text:
-        return "control_only", ""
+        return ("control", "")
 
-    lowered = text.casefold()
-    if re.fullmatch(r"(?:no\s*)+", lowered):
-        return "control_only", ""
+    m = _LEADING_CONTROL_RE.match(text)
+    if not m:
+        return ("clean", text)
 
-    for prefix in sorted(CONTROL_PREFIXES, key=len, reverse=True):
-        pattern = rf"^{re.escape(prefix)}(?:[\s,;:!?]+|$)"
-        match = re.match(pattern, lowered)
-        if match:
-            remainder = text[match.end() :].lstrip(" ,;:!?-")
-            if not remainder:
-                return "control_only", ""
-            return "redirect", remainder
+    remainder = text[m.end() :].lstrip(" ,;:.!?-")
+    remainder = re.sub(
+        r"^(?:and|so|but|then|okay|ok)\b[\s,]*", "", remainder, flags=re.IGNORECASE
+    ).strip()
 
-    return "query", text
+    if not remainder:
+        return ("control", "")
+    return ("redirect", remainder)
 
 
 class AuthoritativeAudioPump:
-    """
-    Real-time 10ms frame scheduler with drift compensation and queue clearance.
-    """
+    """Real-time 10ms frame scheduler with drift compensation and queue clearance."""
 
     def __init__(self, source: rtc.AudioSource, controller: TurnController) -> None:
         self.source = source
@@ -226,7 +221,6 @@ class AuthoritativeAudioPump:
 
                 await self.source.capture_frame(frame)
 
-                # Attribute capture timestamp to this frame's bound turn_id
                 if self.session_manager and turn_id is not None:
                     tracker = self.session_manager.get_latency_tracker(turn_id)
                     if tracker and tracker.t_capture_first_frame == 0.0:
@@ -364,6 +358,13 @@ class SessionManager:
         self.is_closing = False
         self.shutdown_event = asyncio.Event()
 
+        # Fast interim barge-in guard
+        self._interim_cut_fired = False
+
+        # Silence watchdog to terminate orphaned episodes
+        self._episode_timeout_task: Optional[asyncio.Task] = None
+        self.EPISODE_MAX_SILENCE_SEC = 1.4
+
     def create_latency_tracker(self, turn_id: int) -> TurnLatencyTracker:
         tracker = TurnLatencyTracker(
             turn_id=turn_id,
@@ -420,6 +421,21 @@ class SessionManager:
         except Exception:
             return
 
+    async def _publish_transcript(self, text: str, speaker: str, seg_id: str, final: bool = True) -> None:
+        """Broadcasts transcripts directly matching TranscriptFeed's expected schema and topic."""
+        try:
+            payload = json.dumps({
+                "speaker": speaker,
+                "segments": [{"id": seg_id, "text": text, "final": final}],
+            }).encode("utf-8")
+            await self.room.local_participant.publish_data(
+                payload=payload,
+                reliable=True,
+                topic="lk.transcription",
+            )
+        except Exception:
+            logger.debug("Transcript publish failed", exc_info=True)
+
     async def start(self) -> None:
         self.audio_track = rtc.LocalAudioTrack.create_audio_track("agent-mic", self.audio_source)
         options = rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
@@ -437,10 +453,28 @@ class SessionManager:
     async def _ensure_speech_episode(self) -> int:
         if self.active_speech_epoch:
             return self.active_speech_epoch
+        self._interim_cut_fired = False
         episode = await self.controller.begin_speech_episode()
         self.active_speech_epoch = episode.speech_epoch
         logger.info(f"[STT Episode] Opened episode {self.active_speech_epoch}")
         return self.active_speech_epoch
+
+    def _arm_episode_timeout(self) -> None:
+        if self._episode_timeout_task and not self._episode_timeout_task.done():
+            self._episode_timeout_task.cancel()
+        self._episode_timeout_task = self.supervise(
+            self._episode_timeout_watchdog(self.active_speech_epoch),
+            name="episode_timeout",
+        )
+
+    async def _episode_timeout_watchdog(self, epoch: int) -> None:
+        try:
+            await asyncio.sleep(self.EPISODE_MAX_SILENCE_SEC)
+        except asyncio.CancelledError:
+            return
+        if self.active_speech_epoch == epoch:
+            logger.info(f"[STT Episode] Episode {epoch} force-closed on silence timeout")
+            await self.submit_intent(TurnIntent("speech_end", timestamp=time.perf_counter()))
 
     async def _arbiter_worker(self) -> None:
         while not self.is_closing:
@@ -460,6 +494,7 @@ class SessionManager:
                     self.pending_stt_final = intent.timestamp
                     epoch = await self._ensure_speech_episode()
                     await self.controller.append_transcript_final(epoch, intent.payload)
+                    self._arm_episode_timeout()
                 elif intent.kind == "speech_end":
                     self.pending_speech_end = intent.timestamp
                     await self._handle_speech_end()
@@ -511,6 +546,9 @@ class SessionManager:
         await self.set_state("listening")
 
     async def _handle_speech_end(self) -> None:
+        if self._episode_timeout_task and not self._episode_timeout_task.done():
+            self._episode_timeout_task.cancel()
+
         speech_epoch = self.active_speech_epoch
         if not speech_epoch:
             return
@@ -520,10 +558,16 @@ class SessionManager:
         if not transcript or not transcript.strip():
             return
 
-        kind, payload = classify_utterance(transcript)
+        # Publish the finalized user utterance to frontend transcript box
+        self.supervise(
+            self._publish_transcript(transcript.strip(), "user", f"user-{speech_epoch}", True),
+            name="pub_user_transcript",
+        )
+
+        kind, payload = detect_control_speech(transcript)
         logger.info(f"Speech episode {speech_epoch} => {kind}: '{payload}'")
 
-        if kind == "control_only":
+        if kind == "control":
             return
 
         await self._start_turn(payload, is_redirect=(kind == "redirect"))
@@ -692,8 +736,6 @@ class SessionManager:
                         ledger.register_clause(clause_id, clause)
                         await self.set_state("speaking", turn_id)
 
-                        self._last_barge_in = time.monotonic()
-
                         if tracker:
                             tracker.mark("t_tts_start")
 
@@ -736,6 +778,12 @@ class SessionManager:
 
             if not await self.controller.complete_turn(turn_id, "".join(full_reply)):
                 return
+
+            # Publish the full agent response to frontend transcript box
+            self.supervise(
+                self._publish_transcript("".join(full_reply).strip(), "agent", f"agent-{turn_id}", True),
+                name="pub_agent_transcript",
+            )
 
             await self.set_state("listening")
 
@@ -800,15 +848,37 @@ class SessionManager:
 
                 if event_type == stt.SpeechEventType.INTERIM_TRANSCRIPT:
                     text = event.alternatives[0].text if event.alternatives else ""
-                    if text:
+                    if not text:
+                        continue
+                    kind, _ = detect_control_speech(text)
+                    if kind in ("control", "redirect"):
+                        if self.current_state in ("speaking", "thinking") and not self._interim_cut_fired:
+                            self._interim_cut_fired = True
+                            logger.info(f"[STT Fast Cut] Detected '{text}' on interim")
+                            await self.submit_intent(TurnIntent("barge_in", timestamp=time.perf_counter()))
+                    else:
                         await self.submit_intent(TurnIntent("stt_interim", text))
 
                 elif event_type == stt.SpeechEventType.FINAL_TRANSCRIPT:
                     arrival_time = time.perf_counter()
                     text = event.alternatives[0].text if event.alternatives else ""
-                    if text:
-                        logger.info(f"[STT Final] '{text}'")
-                        await self.submit_intent(TurnIntent("stt_final", text, timestamp=arrival_time))
+                    if not text:
+                        continue
+                    logger.info(f"[STT Final] '{text}'")
+
+                    kind, payload = detect_control_speech(text)
+                    if kind == "control":
+                        await self.submit_intent(TurnIntent("barge_in", timestamp=arrival_time))
+                        continue
+                    if kind == "redirect":
+                        await self.submit_intent(TurnIntent("barge_in", timestamp=arrival_time))
+                        if self.active_speech_epoch:
+                            await self.controller.endpoint_speech_episode(self.active_speech_epoch)
+                            self.active_speech_epoch = 0
+                        await self._start_turn(payload, is_redirect=True)
+                        continue
+
+                    await self.submit_intent(TurnIntent("stt_final", text, timestamp=arrival_time))
 
                 elif event_type == stt.SpeechEventType.END_OF_SPEECH:
                     await self.submit_intent(TurnIntent("speech_end", timestamp=time.perf_counter()))
@@ -908,6 +978,7 @@ async def entrypoint(ctx: JobContext) -> None:
         task = session.supervise(session.handle_stt_track(track), f"stt_{track.sid}")
         if task is None:
             subscribed_tracks.discard(track.sid)
+            return
 
     @room.on("track_subscribed")
     def on_track_subscribed(
@@ -915,7 +986,9 @@ async def entrypoint(ctx: JobContext) -> None:
         publication: rtc.TrackPublication,
         participant: rtc.RemoteParticipant,
     ):
-        session.supervise(attach_track(track, participant), f"attach_{track.sid}")
+        task = session.supervise(attach_track(track, participant), f"attach_{track.sid}")
+        if task is None:
+            subscribed_tracks.discard(track.sid)
 
     @room.on("track_unsubscribed")
     def on_track_unsubscribed(
@@ -927,7 +1000,7 @@ async def entrypoint(ctx: JobContext) -> None:
 
     @room.on("disconnected")
     def on_room_disconnected(*args):
-        session.supervise(session.shutdown(), "room_disconnect_shutdown")
+        asyncio.create_task(session.shutdown())
 
     try:
         await session.start()

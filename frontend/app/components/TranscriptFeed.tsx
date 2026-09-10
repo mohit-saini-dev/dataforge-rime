@@ -10,9 +10,8 @@ interface TranscriptEntry {
   final: boolean;
 }
 
-// LiveKit Agents publishes transcriptions on this topic in the format:
-// { segments: [{ id, text, startTime, endTime, final }], participantIdentity, trackSid }
-const TRANSCRIPTION_TOPIC = "lk.transcription";
+// Switched to custom topic to prevent LiveKit SDK internal interception
+const TRANSCRIPTION_TOPIC = "transcript";
 
 export function TranscriptFeed() {
   const [entries, setEntries] = useState<TranscriptEntry[]>([]);
@@ -24,8 +23,9 @@ export function TranscriptFeed() {
     if (!message?.payload) return;
     try {
       const data = JSON.parse(new TextDecoder().decode(message.payload));
+      
       const speaker: "agent" | "user" =
-        message.from?.identity?.startsWith("user") ? "user" : "agent";
+        data.speaker === "user" ? "user" : "agent";
 
       for (const seg of data.segments ?? []) {
         const text = seg.text?.trim();
@@ -46,7 +46,6 @@ export function TranscriptFeed() {
     }
   }, [message]);
 
-  // Auto-scroll to bottom when new entries arrive
   useEffect(() => {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
